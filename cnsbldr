@@ -13,7 +13,7 @@ import shlex
 import json
 
 
-APPNAME = "ansiblebuilder"
+APPNAME = "nsbldr"
 IMAGENAME = APPNAME
 CONTAINERFILE = "Containerfile"
 WORKSPACE = Path(f"/{APPNAME}")
@@ -102,7 +102,7 @@ def playbook(
             "--group-add=root "
             f"{ctrargs}"
             f"-w {shlex.quote(str(WORKSPACE))} "
-            f"-v {shlex.quote(str(globalconffile))}:/srv/ansible/ansiblebuilder.json:ro,z "
+            f"-v {shlex.quote(str(globalconffile))}:/srv/ansible/nsbldr.json:ro,z "
             f"-v {shlex.quote(str(hostconffile))}:/srv/ansible/host.json:ro,z "
             f"-v {shlex.quote(str(ansiblefilesdir))}:/srv/ansible/files:z "
             f"-v {shlex.quote(str(ansibleinventoriesdir))}:/srv/ansible/inventories:z "
@@ -122,7 +122,7 @@ if __name__ == "__main__":
     dryrun = False
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-    parser = argparse.ArgumentParser(description="Run ansiblebuilder in container")
+    parser = argparse.ArgumentParser(description="Run nsbldr in container")
     parser.add_argument(
         "--build", action="store_true", help=f"Build {IMAGENAME} container"
     )
