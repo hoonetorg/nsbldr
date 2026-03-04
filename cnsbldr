@@ -1,0 +1,212 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+
+import logging
+
+from pathlib import Path
+import os
+import sys
+import subprocess
+import shlex
+
+import json
+
+
+APPNAME = "ansiblebuilder"
+IMAGENAME = APPNAME
+CONTAINERFILE = "Containerfile"
+WORKSPACE = Path(f"/{APPNAME}")
+
+
+def subprocess_run_wrapper(
+    cmd: str, dryrun: bool = False, **kwargs
+) -> subprocess.CompletedProcess | None:
+    if kwargs.get("shell"):
+        wcmd = cmd
+    else:
+        wcmd = shlex.split(cmd)
+
+    if dryrun:
+        logging.info(f"[DRYRUN] {cmd}")
+        return None
+
+    logging.info(f"[EXECUTING] {cmd}")
+    return subprocess.run(wcmd, **kwargs)
+
+
+def get_path(path: str) -> Path:
+    return Path(path).expanduser().absolute()
+
+
+def is_readable_file(file: Path) -> bool:
+    return file.exists() and file.is_file() and os.access(file, os.R_OK)
+
+
+def build_image(sourcedir: Path, dryrun: bool = False):
+    subprocess_run_wrapper(
+        cmd=(
+            "podman build "
+            f"-t {shlex.quote(IMAGENAME)} "
+            f"-f {shlex.quote(str(sourcedir / Path(CONTAINERFILE)))}"
+        ),
+        dryrun=dryrun,
+        check=True,
+    )
+
+
+def release(args: list, dryrun: bool = False):
+    subprocess_run_wrapper(
+        cmd=(
+            "podman run "
+            "--pids-limit=-1 "
+            f"-name {shlex.quote(IMAGENAME)} "
+            "--rm"
+            f"-w {shlex.quote(str(WORKSPACE))} "
+            "--entrypoint release "
+            f"{shlex.quote(IMAGENAME)} "
+            f"{' '.join(shlex.quote(a) for a in args)}"
+        ),
+        dryrun=dryrun,
+        check=True,
+    )
+
+
+def playbook(
+    interactive: bool,
+    globalconffile: Path,
+    hostconffile: Path,
+    ansiblefilesdir: Path,
+    ansibleinventoriesdir: Path,
+    ansibleplaybooksdir: Path,
+    ansiblerolesdir: Path,
+    ansiblecollectionsdir: Path,
+    ansiblelogsdir: Path,
+    ansiblecommand: str,
+    args: list,
+    dryrun: bool = False,
+):
+    ctrargs = "--rm "
+    if interactive:
+        ctrargs += "-it --entrypoint /bin/bash "
+        logging.info(f"ansiblecommand:  {shlex.quote(str(ansiblecommand))}")
+
+    subprocess_run_wrapper(
+        cmd=(
+            "podman "
+            "run "
+            "--pids-limit=-1 "
+            f"--name {shlex.quote(str(IMAGENAME))} "
+            "--network=host "
+            "--user=root "
+            "--group-add=root "
+            f"{ctrargs}"
+            f"-w {shlex.quote(str(WORKSPACE))} "
+            f"-v {shlex.quote(str(globalconffile))}:/srv/ansible/ansiblebuilder.json:ro,z "
+            f"-v {shlex.quote(str(hostconffile))}:/srv/ansible/host.json:ro,z "
+            f"-v {shlex.quote(str(ansiblefilesdir))}:/srv/ansible/files:z "
+            f"-v {shlex.quote(str(ansibleinventoriesdir))}:/srv/ansible/inventories:z "
+            f"-v {shlex.quote(str(ansibleplaybooksdir))}:/srv/ansible/playbooks:z "
+            f"-v {shlex.quote(str(ansiblerolesdir))}:/srv/ansible/roles:z "
+            f"-v {shlex.quote(str(ansiblecollectionsdir))}:/srv/ansible/collections:z "
+            f"-v {shlex.quote(str(ansiblelogsdir))}:/srv/ansible/logs:z "
+            f"{shlex.quote(str(IMAGENAME))} "
+            f"{' '.join(shlex.quote(a) for a in args)}"
+        ),
+        dryrun=dryrun,
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    dryrun = False
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+    parser = argparse.ArgumentParser(description="Run ansiblebuilder in container")
+    parser.add_argument(
+        "--build", action="store_true", help=f"Build {IMAGENAME} container"
+    )
+    parser.add_argument(
+        "--sourcedir",
+        type=str,
+        default=".",
+        help="sourcedir for building container (default '.')",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run container in interactive mode with /bin/bash",
+    )
+    parser.add_argument(
+        "--globalconffile",
+        type=str,
+        default=f"./{APPNAME}.json",
+        help=f"{APPNAME} config file (default './{APPNAME}.json')",
+    )
+    parser.add_argument(
+        "--hostconffile",
+        type=str,
+        default="./host.json",
+        help="Host config file (default './host.json')",
+    )
+
+    args, passthrough = parser.parse_known_args()
+
+    sourcedir = get_path(args.sourcedir)
+
+    logging.info(f"sourcedir: {shlex.quote(str(sourcedir))}")
+
+    if args.build:
+        build_image(sourcedir=sourcedir, dryrun=dryrun)
+        sys.exit(0)
+
+    globalconffile = get_path(args.globalconffile)
+    if not is_readable_file(file=globalconffile):
+        logging.error(
+            f"Config file not found or not readable: {shlex.quote(str(globalconffile))}"
+        )
+        sys.exit(1)
+    logging.info(f"globalconffile: {shlex.quote(str(globalconffile))}")
+    globalconf = json.loads(globalconffile.read_text(encoding="utf-8"))
+    logging.info(f"globalconf:\n{json.dumps(globalconf, indent=2)}")
+
+    hostconffile = get_path(args.hostconffile)
+    if not is_readable_file(file=hostconffile):
+        logging.error(
+            f"Config file not found or not readable: {shlex.quote(str(hostconffile))}"
+        )
+        sys.exit(1)
+    logging.info(f"hostconffile: {shlex.quote(str(hostconffile))}")
+    hostconf = json.loads(hostconffile.read_text(encoding="utf-8"))
+    logging.info(f"hostconf:\n{json.dumps(hostconf, indent=2)}")
+
+    ansiblefilesdir = get_path(globalconf["ansiblefilesdir"])
+    ansibleinventoriesdir = get_path(hostconf["ansibleinventoriesdir"])
+    ansibleplaybooksdir = get_path(globalconf["ansibleplaybooksdir"])
+    ansiblerolesdir = get_path(globalconf["ansiblerolesdir"])
+    ansiblecollectionsdir = get_path(globalconf["ansiblecollectionsdir"])
+    ansiblelogsdir = get_path(globalconf["ansiblelogsdir"])
+    ansiblecommand = hostconf["ansiblecommand"]
+
+    logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
+    logging.info(f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}")
+    logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
+    logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
+    logging.info(f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}")
+    logging.info(f"ansiblelogsdir: {shlex.quote(str(ansiblelogsdir))}")
+    logging.info(f"ansiblecommand: {shlex.quote(str(ansiblecommand))}")
+
+    playbook(
+        interactive=args.interactive,
+        globalconffile=globalconffile,
+        hostconffile=hostconffile,
+        ansiblefilesdir=ansiblefilesdir,
+        ansibleinventoriesdir=ansibleinventoriesdir,
+        ansibleplaybooksdir=ansibleplaybooksdir,
+        ansiblerolesdir=ansiblerolesdir,
+        ansiblecollectionsdir=ansiblecollectionsdir,
+        ansiblelogsdir=ansiblelogsdir,
+        ansiblecommand=ansiblecommand,
+        args=passthrough,
+        dryrun=dryrun,
+    )

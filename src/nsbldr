@@ -1,0 +1,672 @@
+#!/usr/bin/env -S python3 -u
+import logging
+
+import http.server
+import socketserver
+import threading
+
+import os
+import sys
+import subprocess
+import shlex
+import shutil
+
+from pathlib import Path
+
+import pwd
+import grp
+
+import json
+
+ANSIBLEFILESDIRPATH = "/srv/ansible/files"
+ANSIBLEINVENTORIESDIRPATH = "/srv/ansible/inventories"
+ANSIBLEPLAYBOOKSDIRPATH = "/srv/ansible/playbooks"
+ANSIBLEROLESDIRPATH = "/srv/ansible/roles"
+ANSIBLECOLLECTIONSPATH = "/srv/ansible/collections"
+ANSIBLELOGSDIRPATH = "/srv/ansible/logs"
+GLOBALCONF = "/srv/ansible/nsbldr.json"
+HOSTCONF = "/srv/ansible/host.json"
+
+
+def subprocess_run_wrapper(
+    cmd: str, dryrun: bool = False, **kwargs
+) -> subprocess.CompletedProcess | None:
+    if kwargs.get("shell"):
+        wcmd = cmd
+    else:
+        wcmd = shlex.split(cmd)
+
+    if dryrun:
+        logging.info(f"[DRYRUN] {cmd}")
+        return None
+
+    logging.info(f"[EXECUTING] {cmd}")
+    return subprocess.run(wcmd, **kwargs)
+
+
+def subprocess_Popen_wrapper(
+    cmd: str, dryrun: bool = False, **kwargs
+) -> subprocess.Popen | None:
+    if kwargs.get("shell"):
+        wcmd = cmd
+    else:
+        wcmd = shlex.split(cmd)
+
+    if dryrun:
+        logging.info(f"[DRYRUN] {cmd}")
+        return None
+
+    logging.info(f"[EXECUTING] {cmd}")
+    return subprocess.Popen(wcmd, **kwargs)
+
+
+def get_path(path):
+    return Path(path).expanduser().absolute()
+
+
+def split_multi_ext(path: Path):
+    suffixes = "".join(path.suffixes)
+    if suffixes:
+        stem = path.name[: -len(suffixes)]
+        ext = suffixes.lstrip(".")
+    else:
+        stem = path.name
+        ext = ""
+    return stem, ext
+
+
+def is_readable_file(file: Path) -> bool:
+    return file.exists() and file.is_file() and os.access(file, os.R_OK)
+
+
+def copy_all_files_from_dir(srcdir: Path, srcglob: str, tgtdir: Path) -> list:
+    cleanupfiles = []
+    if srcdir.exists():
+        tgtdir.mkdir(parents=True, exist_ok=True)
+        srcfiles = srcdir.glob(srcglob)
+        for f in srcfiles:
+            t = tgtdir / f.name
+            if not t.exists():
+                cleanupfiles.append(t)
+                logging.info(f"Copying {shlex.quote(str(f))} to {shlex.quote(str(t))}")
+                shutil.copy2(f, t)
+            else:
+                logging.info(
+                    f"Not overwriting {shlex.quote(str(t))} with {shlex.quote(str(f))}"
+                )
+
+    return cleanupfiles
+
+
+def reset_apt_sources(ansibleinventoriesdir: Path):
+    dirs = [Path("/etc/apt"), Path("/etc/ansible/apt")]
+
+    for d in dirs:
+        sl = d / "sources.list"
+        if sl.exists():
+            sl.unlink()
+            logging.info(f"Deleted {sl}")
+
+        sldir = d / "sources.list.d"
+        if sldir.exists():
+            for f in sldir.glob("*.list"):
+                f.unlink()
+                logging.info(f"Deleted {f}")
+            for f in sldir.glob("*.sources"):
+                f.unlink()
+                logging.info(f"Deleted {f}")
+
+        copy_all_files_from_dir(
+            srcdir=ansibleinventoriesdir / "apt", srcglob="sources.list", tgtdir=d
+        )
+
+        copy_all_files_from_dir(
+            srcdir=ansibleinventoriesdir / "apt" / "sources.list.d",
+            srcglob="*.list",
+            tgtdir=d / "sources.list.d",
+        )
+
+        copy_all_files_from_dir(
+            srcdir=ansibleinventoriesdir / "apt" / "sources.list.d",
+            srcglob="*.sources",
+            tgtdir=d / "sources.list.d",
+        )
+
+
+class ThreadedHTTPServer:
+    def __init__(self, root: str, port: int):
+        os.chdir(root)
+        handler = http.server.SimpleHTTPRequestHandler
+        self.httpd = socketserver.TCPServer(("", port), handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def start(self):
+        logging.info(
+            f"Serving {os.getcwd()} on http://0.0.0.0:{self.httpd.server_address[1]}"
+        )
+        self.thread.start()
+
+    def stop(self):
+        logging.info("Stopping HTTP server")
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join()
+
+
+def do_ansiblemirror(
+    ansibleclasses: list,
+    ansibleinventoriesdir: Path,
+    ansiblerolesdir: Path,
+    dryrun: bool = False,
+):
+    ansiblemirrormarker = ansiblerolesdir / "mirror-is-up-to-date"
+
+    logging.info("Checking mirror freshness")
+
+    if ansiblemirrormarker.is_file():
+        logging.info(
+            f"Mirror is up to date, ansiblemirror marker file is existing {shlex.quote(str(ansiblemirrormarker))}"
+        )
+        return
+
+    logging.info(
+        f"Mirror is outdated or missing, ansiblemirror marker file {shlex.quote(str(ansiblemirrormarker))} is not a file - running ansible-mirror"
+    )
+
+    # "ansible-mirror -v -V -b -Im9999 "
+    subprocess_run_wrapper(
+        cmd=(
+            "ansible-mirror -v -V -b -m1 "
+            f"-C {shlex.quote(str(ansibleinventoriesdir))} "
+            f"-c '{','.join(ansibleclasses)},GRUB_PC,GRUB_EFI,AMD64,FB' "
+            f"{shlex.quote(str(ansiblerolesdir))}"
+        ),
+        dryrun=dryrun,
+    )
+
+    if not dryrun:
+        logging.info(
+            f"Mirror finished, touching ansiblemirror marker file: {shlex.quote(str(ansiblemirrormarker))}"
+        )
+        ansiblemirrormarker.touch()
+
+
+def do_make_basefile(
+    ansiblefilesdir: Path,
+    basefile: Path,
+    ansibleplaybooksdir: Path,
+    dryrun: bool = False,
+):
+    basefilefull = ansiblefilesdir / basefile
+
+    logging.info(f"Checking if basefile {shlex.quote(str(basefilefull))} exists")
+
+    if basefilefull.is_file():
+        logging.info(f"Basefile {shlex.quote(str(basefilefull))} already exists")
+        return
+
+    logging.info(
+        f"Basefile {shlex.quote(str(basefilefull))} is outdated or missing - running mk-basefile"
+    )
+
+    basefilebase, basefileext = split_multi_ext(basefile)
+
+    subprocess_run_wrapper(
+        cmd=(
+            f"{shlex.quote(str(ansibleplaybooksdir / 'basefiles' / 'mk-basefile'))} -J {shlex.quote(str(basefilebase))}"
+        ),
+        dryrun=dryrun,
+        cwd=ansiblefilesdir,
+    )
+
+
+def do_build_iso(
+    ansibleclasses: list,
+    hostconf: dict,
+    ansibleinventoriesdir: Path,
+    ansibleplaybooksdir: Path,
+    ansiblerolesdir: Path,
+    ansiblelogsdir: Path,
+    dryrun: bool = False,
+):
+
+    classesfile = ansibleplaybooksdir / "class" / "50-host-classes"
+
+    keymap = str(hostconf["keymap"])
+    timezone = str(hostconf["timezone"])
+    rootpw = str(hostconf["rootpw"])
+    username = str(hostconf["username"])
+    userpw = str(hostconf["userpw"])
+    diskpath = Path(hostconf["diskpath"])
+    rootsizemib = int(hostconf["rootsizemib"])
+    cryptpw = str(hostconf["cryptpw"])
+
+    logging.info("hostconf:")
+    logging.info(f"keymap: {str(keymap)}")
+    logging.info(f"timezone: {str(timezone)}")
+    logging.info("rootpw: hidden")
+    logging.info(f"username: {str(username)}")
+    logging.info("userpw: hidden")
+    logging.info(f"diskpath: {shlex.quote(str(diskpath))}")
+    logging.info(f"rootsizemib: {int(rootsizemib)}")
+    logging.info("cryptpw: hidden")
+
+    content = (
+        "#!/bin/bash\n"
+        "# generated by nsbldr\n"
+        f"echo '{' '.join(ansibleclasses)} FB'\n"
+    )
+    if dryrun:
+        logging.info(
+            f"[DRYRUN] Would write to {shlex.quote(str(classesfile))}:\n{content.strip()}"
+        )
+    else:
+        logging.info(f"Writing to {shlex.quote(str(classesfile))}:\n{content.strip()}")
+        classesfile.write_text(content)
+
+    logging.info(f"Making {shlex.quote(str(classesfile))} executable")
+    classesfilemode = classesfile.stat().st_mode
+    classesfile.chmod(classesfilemode | 0o111)
+
+    variablesfile = ansibleplaybooksdir / "class" / "FB.var"
+    content = (
+        "# generated by nsbldr\n"
+        f"KEYMAP='{str(keymap)}'\n"
+        f"TIMEZONE='{str(timezone)}'\n"
+        f"ROOTPW={shlex.quote(str(rootpw))}\n"
+        f"username='{str(username)}'\n"
+        f"USERPW={shlex.quote(str(userpw))}\n"
+        f"DISKPATH={shlex.quote(str(diskpath))}\n"
+        f"CRYPTPW={shlex.quote(str(cryptpw))}\n"
+        f"ROOTSIZEMIB='{int(rootsizemib)}'\n"
+    )
+
+    if dryrun:
+        logging.info(
+            f"[DRYRUN] Would write to {shlex.quote(str(variablesfile))}\n{content.strip()}"
+        )
+    else:
+        logging.info(f"Writing to {shlex.quote(str(variablesfile))}\n{content.strip()}")
+        variablesfile.write_text(content)
+
+    subprocess_run_wrapper(
+        cmd=(
+            "ansible-cd "
+            f"-C {shlex.quote(str(ansibleinventoriesdir))} "
+            f"-g {shlex.quote(str(ansibleplaybooksdir / 'grub.cfg'))} "
+            f"-m {shlex.quote(str(ansiblerolesdir))} "
+        ),
+        dryrun=dryrun,
+    )
+
+    for f in [classesfile, variablesfile]:
+        if f.is_file():
+            logging.info(f"Cleanup {shlex.quote(str(f))}")
+            f.unlink()
+
+
+def do_build_img_from_iso(
+    isofilefull: Path,
+    dryrun: bool = False,
+):
+
+    imgfilefull = isofilefull.with_suffix(".img")
+
+    if imgfilefull.is_file():
+        logging.info(
+            f"IMG already exists: {shlex.quote(str(imgfilefull))} - refusing to overwrite."
+        )
+        return
+
+    logging.info(
+        f"Creating IMG file {shlex.quote(str(imgfilefull))} from ISO file {shlex.quote(str(isofilefull))}"
+    )
+
+    if not is_readable_file(file=isofilefull):
+        logging.error(
+            f"\nISO file {shlex.quote(str(isofilefull))} does not exist - Exiting"
+        )
+        sys.exit(1)
+
+    logging.info(f"Processing file: {shlex.quote(str(isofilefull))}")
+
+    isopath = Path("/iso")
+    efipath = Path("/efi")
+    cdpath = Path("/cd")
+
+    for p in {isopath, efipath, cdpath}:
+        p.mkdir(parents=True, exist_ok=True)
+
+    imagesizegb = 6
+    efilabel = "EFI"
+    cdlabel = "ANSIBLE_CD"
+
+    logging.info("Mounting ISO contents")
+    subprocess_run_wrapper(
+        cmd=(
+            f"mount -o loop,ro {shlex.quote(str(isofilefull))} {shlex.quote(str(isopath))}"
+        ),
+        dryrun=dryrun,
+    )
+
+    logging.info("Creating disk image")
+    subprocess_run_wrapper(
+        cmd=(
+            f"qemu-img create -f raw -o preallocation=off {shlex.quote(str(imgfilefull))} {int(imagesizegb)}G"
+        ),
+        dryrun=dryrun,
+    )
+
+    logging.info("Partitioning the disk")
+    subprocess_run_wrapper(
+        cmd=(
+            "parted --script "
+            f"{shlex.quote(str(imgfilefull))} "
+            "mklabel gpt "
+            "mkpart primary fat32 1MiB 125MiB "
+            "mkpart primary ext4 125MiB 100%"
+        ),
+        dryrun=dryrun,
+    )
+
+    logging.info("Mapping partitions")
+    try:
+        result = subprocess_run_wrapper(
+            cmd=(f"losetup --show -fP {shlex.quote(str(imgfilefull))}"),
+            dryrun=dryrun,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+
+        loopdevice = Path(result.stdout.strip())
+        logging.info(f"loopdevice:\n{shlex.quote(str(loopdevice))}")
+    except subprocess.CalledProcessError as err:
+        logging.error(f"losetup ansibleled: {err.stderr}")
+        sys.exit(1)
+
+    subprocess_run_wrapper(
+        cmd=(f"kpartx -av {shlex.quote(str(loopdevice))}"),
+        dryrun=dryrun,
+    )
+
+    part1 = Path("/dev/mapper") / (loopdevice.name + "p1")
+    part2 = Path("/dev/mapper") / (loopdevice.name + "p2")
+
+    logging.info("Formatting and mounting partitions")
+
+    subprocess_run_wrapper(
+        cmd=(f"mkfs.vfat -F 32 -n {efilabel} {shlex.quote(str(part1))}"),
+        dryrun=dryrun,
+    )
+    subprocess_run_wrapper(
+        cmd=(f"mount {shlex.quote(str(part1))} {shlex.quote(str(efipath))}"),
+        dryrun=dryrun,
+    )
+    # subprocess_run_wrapper(
+    #     cmd=(f"mkfs.ext4 -L {cdlabel} {shlex.quote(str(part2))}"),
+    #     dryrun=dryrun,
+    # )
+    subprocess_run_wrapper(
+        cmd=(
+            f"mkfs.btrfs --data single --metadata dup -L {cdlabel} {shlex.quote(str(part2))}"
+        ),
+        dryrun=dryrun,
+    )
+    subprocess_run_wrapper(
+        cmd=(f"mount {shlex.quote(str(part2))} {shlex.quote(str(cdpath))}"),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(
+            "grub-install "
+            f"--efi-directory={shlex.quote(str(efipath))} "
+            f"--boot-directory={shlex.quote(str(efipath))} "
+            "--target=x86_64-efi "
+            "--no-nvram "
+            "--removable "
+            "--uefi-secure-boot "
+        ),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(
+            "rsync "
+            "-av "
+            "--exclude=EFI/ "
+            f"{shlex.quote(str(isopath) + '/')} "
+            f"{shlex.quote(str(cdpath) + '/')}"
+        ),
+        dryrun=dryrun,
+    )
+
+    (efipath / "EFI" / "BOOT").mkdir(parents=True, exist_ok=True)
+
+    subprocess_run_wrapper(
+        cmd=(
+            "rsync "
+            "-av "
+            "/usr/local/etc/grub.cfg "
+            f"{shlex.quote(str(efipath / 'EFI' / 'BOOT'))} "
+        ),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(f"umount {shlex.quote(str(efipath))}"),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(f"umount {shlex.quote(str(cdpath))}"),
+        dryrun=dryrun,
+    )
+
+    logging.info("Cleaning up")
+    subprocess_run_wrapper(
+        cmd=(f"kpartx -d {shlex.quote(str(loopdevice))}"),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(f"losetup -d {shlex.quote(str(loopdevice))}"),
+        dryrun=dryrun,
+    )
+
+    subprocess_run_wrapper(
+        cmd=(f"umount {shlex.quote(str(isopath))}"),
+        dryrun=dryrun,
+    )
+
+    logging.info(f"Disk image {imgfilefull} created successfully")
+
+
+def main():
+    dryrun = False
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+    ansiblefilesdir = get_path(ANSIBLEFILESDIRPATH)
+    ansibleinventoriesdir = get_path(ANSIBLEINVENTORIESDIRPATH)
+    ansibleplaybooksdir = get_path(ANSIBLEPLAYBOOKSDIRPATH)
+    ansiblerolesdir = get_path(ANSIBLEROLESDIRPATH)
+    ansiblecollectionsdir = get_path(ANSIBLECOLLECTIONSPATH)
+    ansiblelogsdir = get_path(ANSIBLELOGSDIRPATH)
+
+    logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
+    logging.info(f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}")
+    logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
+    logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
+    logging.info(f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}")
+    logging.info(f"ansiblelogsdir: {shlex.quote(str(ansiblelogsdir))}")
+
+    # 0
+    root_uid = pwd.getpwnam("root").pw_uid
+    root_gid = grp.getgrnam("root").gr_gid
+
+    for d in [ansiblefilesdir, ansiblerolesdir, ansiblelogsdir]:
+        if d.exists():
+            os.chown(d, root_uid, root_gid)
+            d.chmod(0o755)
+        else:
+            logging.info(f"[WARN] Directory does not exist: {shlex.quote(str(d))}")
+
+    globalconffile = get_path(GLOBALCONF)
+    if not is_readable_file(file=globalconffile):
+        logging.error(
+            f"Config file not found or not readable: {shlex.quote(str(globalconffile))}"
+        )
+        sys.exit(1)
+    logging.info(f"globalconffile: {shlex.quote(str(globalconffile))}")
+    globalconf = json.loads(globalconffile.read_text(encoding="utf-8"))
+    logging.info(f"globalconf:\n{json.dumps(globalconf, indent=2)}")
+
+    basefilenfs = Path(globalconf["basefilenfs"])
+    logging.info(f"basefilenfs: {basefilenfs}")
+
+    hostconffile = get_path(HOSTCONF)
+    if not is_readable_file(file=hostconffile):
+        logging.error(
+            f"Config file not found or not readable: {shlex.quote(str(hostconffile))}"
+        )
+        sys.exit(1)
+    logging.info(f"hostconffile: {shlex.quote(str(hostconffile))}")
+    hostconf = json.loads(hostconffile.read_text(encoding="utf-8"))
+    logging.info(f"hostconf:\n{json.dumps(hostconf, indent=2)}")
+
+    ansibleclasses = hostconf["ansibleclasses"]
+    basefile = Path(hostconf["basefile"])
+    basefileclass = hostconf["basefileclass"]
+
+    logging.info(f"ansibleclasses: {ansibleclasses}")
+    logging.info(f"basefile: {shlex.quote(str(basefile))}")
+
+    reset_apt_sources(ansibleinventoriesdir=ansiblecollectionsdir)
+
+    cleanupfiles = []
+    installcleanupfiles = []
+    nfscleanupfiles = []
+
+    for etcdir in [ansibleinventoriesdir, ansiblecollectionsdir]:
+        cleanupfiles.extend(
+            copy_all_files_from_dir(
+                srcdir=etcdir / "apt" / "trusted.gpg.d",
+                srcglob="*.gpg",
+                tgtdir=Path("/etc/apt/trusted.gpg.d"),
+            )
+        )
+        cleanupfiles.extend(
+            copy_all_files_from_dir(
+                srcdir=etcdir / "apt" / "trusted.gpg.d",
+                srcglob="*.gpg",
+                tgtdir=Path("/usr/share/keyrings"),
+            )
+        )
+        cleanupfiles.extend(
+            copy_all_files_from_dir(
+                srcdir=etcdir / "apt-cacher-ng",
+                srcglob="*.conf",
+                tgtdir=Path("/etc/apt-cacher-ng"),
+            )
+        )
+
+    server = ThreadedHTTPServer(root="/var/cache/apt-cacher-ng", port=8000)
+    server.start()
+
+    installcleanupfiles.extend(
+        copy_all_files_from_dir(
+            srcdir=ansibleinventoriesdir / "apt" / "apt.conf.d",
+            srcglob="*.conf",
+            tgtdir=Path("/etc/apt/apt.conf.d"),
+        )
+    )
+
+    installcleanupfiles.extend(
+        copy_all_files_from_dir(
+            srcdir=ansibleinventoriesdir,
+            srcglob="mk-basefile.conf",
+            tgtdir=Path("/etc/ansible"),
+        )
+    )
+
+    do_ansiblemirror(
+        ansibleclasses=ansibleclasses,
+        ansibleinventoriesdir=ansibleinventoriesdir,
+        ansiblerolesdir=ansiblerolesdir,
+        dryrun=dryrun,
+    )
+
+    do_make_basefile(
+        ansiblefilesdir=ansiblefilesdir,
+        basefile=basefile,
+        ansibleplaybooksdir=ansibleplaybooksdir,
+        dryrun=dryrun,
+    )
+
+    for f in installcleanupfiles:
+        if f.exists and (f.is_file() or f.is_dir()):
+            logging.info(f"Deleting {shlex.quote(str(f))}")
+            f.unlink()
+
+    nfscleanupfiles.extend(
+        copy_all_files_from_dir(
+            srcdir=ansiblecollectionsdir / "apt" / "apt.conf.d",
+            srcglob="*.conf",
+            tgtdir=Path("/etc/apt/apt.conf.d"),
+        )
+    )
+
+    nfscleanupfiles.extend(
+        copy_all_files_from_dir(
+            srcdir=ansiblecollectionsdir,
+            srcglob="mk-basefile.conf",
+            tgtdir=Path("/etc/ansible"),
+        )
+    )
+
+    do_make_basefile(
+        ansiblefilesdir=ansiblefilesdir,
+        basefile=basefilenfs,
+        ansibleplaybooksdir=ansibleplaybooksdir,
+        dryrun=dryrun,
+    )
+
+    for f in nfscleanupfiles:
+        if f.exists and (f.is_file() or f.is_dir()):
+            logging.info(f"Deleting {shlex.quote(str(f))}")
+            f.unlink()
+
+    basefilefull = ansiblefilesdir / basefile
+    basefiledest = ansibleplaybooksdir / "basefiles" / f"{basefileclass}.tar.xz"
+    logging.info(
+        f"Copying {shlex.quote(str(basefilefull))} to {shlex.quote(str(basefiledest))}"
+    )
+    shutil.copy2(basefilefull, basefiledest)
+
+    do_build_iso(
+        ansibleclasses=ansibleclasses,
+        hostconf=hostconf,
+        ansibleinventoriesdir=ansibleinventoriesdir,
+        ansibleplaybooksdir=ansibleplaybooksdir,
+        ansiblerolesdir=ansiblerolesdir,
+        ansiblelogsdir=ansiblelogsdir,
+        dryrun=dryrun,
+    )
+
+    logging.info(f"Deleting {shlex.quote(str(basefiledest))}")
+    basefiledest.unlink()
+
+    server.stop()
+
+    for f in cleanupfiles:
+        if f.exists and (f.is_file() or f.is_dir()):
+            logging.info(f"Deleting {shlex.quote(str(f))}")
+            f.unlink()
+
+    logging.info("Script finished.")
+
+
+if __name__ == "__main__":
+    main()
