@@ -1,22 +1,30 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse
-
-import logging
-
-from pathlib import Path
-import os
-import sys
-import subprocess
-import shlex
-
 import json
-
+import logging
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
 
 APPNAME = "nsbldr"
 IMAGENAME = APPNAME
 CONTAINERFILE = "Containerfile"
 WORKSPACE = Path(f"/{APPNAME}")
+ARCHIVE_MEMBERS = [
+    f"{APPNAME}.json",
+    "host.json",
+    "files",
+    "inventories",
+    "playbooks",
+    "roles",
+    "collections",
+]
 
 
 def subprocess_run_wrapper(
@@ -41,6 +49,169 @@ def get_path(path: str) -> Path:
 
 def is_readable_file(file: Path) -> bool:
     return file.exists() and file.is_file() and os.access(file, os.R_OK)
+
+
+def is_readable_dir(path: Path) -> bool:
+    return path.exists() and path.is_dir() and os.access(path, os.R_OK)
+
+
+def find_gpg_binary() -> str:
+    gpg_bin = shutil.which("gpg")
+    if not gpg_bin:
+        raise FileNotFoundError("Required program 'gpg' not found in PATH")
+    return gpg_bin
+
+
+def validate_workspace_root(workspace_root: Path):
+    required = [f"{APPNAME}.json", "host.json"]
+    missing = [name for name in required if not is_readable_file(workspace_root / name)]
+    if missing:
+        raise FileNotFoundError(
+            f"Workspace root {workspace_root} is missing required files: {', '.join(missing)}"
+        )
+
+
+def create_workspace_tar_from_runtime(
+    outfile: Path,
+    globalconffile: Path,
+    hostconffile: Path,
+    globalconf: dict,
+    hostconf: dict,
+):
+    logging.info(f"create_workspace_tar_from_runtime: Creating tar {outfile}")
+    file_map = {
+        f"{APPNAME}.json": globalconffile,
+        "host.json": hostconffile,
+        "files": get_path(globalconf["ansiblefilesdir"]),
+        "inventories": get_path(hostconf["ansibleinventoriesdir"]),
+        "playbooks": get_path(globalconf["ansibleplaybooksdir"]),
+        "roles": get_path(globalconf["ansiblerolesdir"]),
+        "collections": get_path(globalconf["ansiblecollectionsdir"]),
+    }
+
+    for arcname, src in file_map.items():
+        if arcname.endswith(".json"):
+            if not is_readable_file(src):
+                raise FileNotFoundError(f"Required file missing: {src}")
+        else:
+            if not is_readable_dir(src):
+                raise FileNotFoundError(f"Required directory missing: {src}")
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(outfile, mode="w") as tf:
+        for arcname, src in file_map.items():
+            logging.info(f"Adding to archive: {src} -> {arcname}")
+            tf.add(src, arcname=arcname, recursive=True)
+
+
+def encrypt_content(
+    outfile: Path,
+    globalconffile: Path,
+    hostconffile: Path,
+    globalconf: dict,
+    hostconf: dict,
+    dryrun: bool = False,
+):
+    gpg_bin = find_gpg_binary()
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+
+    wsglobalconf = globalconf.copy()
+    wshostconf = hostconf.copy()
+    logging.info(
+        f"encrypt_content: wsglobalconf b4:\n{json.dumps(wsglobalconf, indent=2)}"
+    )
+    logging.info(f"encrypt_content: wshostconf b4:\n{json.dumps(wshostconf, indent=2)}")
+    del wsglobalconf["ansiblerolesdir"]
+    del wsglobalconf["ansibleplaybooksdir"]
+    del wsglobalconf["ansiblecollectionsdir"]
+    del wsglobalconf["ansiblefilesdir"]
+    del wsglobalconf["ansiblelogsdir"]
+    del wshostconf["ansibleinventoriesdir"]
+    logging.info(
+        f"encrypt_content: wsglobalconf after:\n{json.dumps(wsglobalconf, indent=2)}"
+    )
+    logging.info(
+        f"encrypt_content: wshostconf after:\n{json.dumps(wshostconf, indent=2)}"
+    )
+
+    with tempfile.TemporaryDirectory(prefix=f"{APPNAME}-pack-") as tmpdir:
+        logging.info(f"encrypt_content: tmpdir: {tmpdir}")
+        tarpath = Path(tmpdir) / "ansibleinput.tar"
+
+        wsglobalconffile = Path(tmpdir) / f"{APPNAME}.json"
+        wshostconffile = Path(tmpdir) / "host.json"
+        wsglobalconffile.write_text(json.dumps(wsglobalconf, indent=2))
+        wshostconffile.write_text(json.dumps(wshostconf, indent=2))
+
+        create_workspace_tar_from_runtime(
+            outfile=tarpath,
+            globalconffile=wsglobalconffile,
+            hostconffile=wshostconffile,
+            globalconf=globalconf,
+            hostconf=hostconf,
+        )
+        subprocess_run_wrapper(
+            cmd=(
+                f"{shlex.quote(gpg_bin)} "
+                f"--pinentry-mode loopback "
+                f"--symmetric "
+                f"--cipher-algo AES256 "
+                f"--s2k-digest-algo SHA512 "
+                f"--s2k-mode 3 "
+                f"--s2k-count 65011712 "
+                f"--output {shlex.quote(str(outfile))} "
+                f"{shlex.quote(str(tarpath))}"
+            ),
+            dryrun=dryrun,
+            check=True,
+        )
+
+
+def is_within_directory(directory: Path, target: Path) -> bool:
+    try:
+        directory = directory.resolve()
+        target = target.resolve()
+    except FileNotFoundError:
+        directory = directory.absolute()
+        target = target.absolute()
+    return os.path.commonpath([str(directory), str(target)]) == str(directory)
+
+
+def safe_extract_tar(infile: Path, destdir: Path):
+    destdir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(infile, mode="r") as tf:
+        for member in tf.getmembers():
+            target = destdir / member.name
+            if not is_within_directory(destdir, target):
+                raise ValueError(f"Unsafe archive member path: {member.name}")
+        tf.extractall(path=destdir)
+
+
+def decrypt_content(infile: Path, destdir: Path, dryrun: bool = False):
+    gpg_bin = find_gpg_binary()
+    if not is_readable_file(infile):
+        raise FileNotFoundError(
+            f"Encrypted content archive not found or not readable: {infile}"
+        )
+
+    destdir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"{APPNAME}-unpack-") as tmpdir:
+        tarpath = Path(tmpdir) / "ansibleinput.tar"
+        subprocess_run_wrapper(
+            cmd=(
+                f"{shlex.quote(gpg_bin)} "
+                f"--pinentry-mode loopback "
+                f"--decrypt "
+                f"--output {shlex.quote(str(tarpath))} "
+                f"{shlex.quote(str(infile))}"
+            ),
+            dryrun=dryrun,
+            check=True,
+        )
+        if dryrun:
+            return
+        safe_extract_tar(infile=tarpath, destdir=destdir)
+        validate_workspace_root(destdir)
 
 
 def build_image(sourcedir: Path, dryrun: bool = False):
@@ -149,6 +320,15 @@ def playbook(
     )
 
 
+def load_config(configfile: Path, label: str) -> dict:
+    if not is_readable_file(file=configfile):
+        raise FileNotFoundError(f"{label} not found or not readable: {configfile}")
+    logging.info(f"{label}: {shlex.quote(str(configfile))}")
+    data = json.loads(configfile.read_text(encoding="utf-8"))
+    logging.info(f"{label} content:\n{json.dumps(data, indent=2)}")
+    return data
+
+
 if __name__ == "__main__":
     dryrun = False
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -184,6 +364,34 @@ if __name__ == "__main__":
         help="Image archive format for --export-image (default: oci-archive)",
     )
     parser.add_argument(
+        "--encrypt-content",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Create a self-contained encrypted gpg archive from the current mapped Ansible input.",
+    )
+    parser.add_argument(
+        "--decrypt-content",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Decrypt and extract a self-contained encrypted gpg archive.",
+    )
+    parser.add_argument(
+        "--decrypt-to",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Extraction target directory for --decrypt-content.",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Use an extracted self-contained workspace instead of host-mapped dirs.",
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help="Run container in interactive mode with /bin/bash",
@@ -207,70 +415,109 @@ if __name__ == "__main__":
 
     logging.info(f"sourcedir: {shlex.quote(str(sourcedir))}")
 
-    if args.build:
-        build_image(sourcedir=sourcedir, dryrun=dryrun)
-        sys.exit(0)
+    try:
+        if args.build:
+            build_image(sourcedir=sourcedir, dryrun=dryrun)
+            sys.exit(0)
 
-    if args.export_image:
-        export_image(
-            outfile=get_path(args.export_image),
-            image=IMAGENAME,
-            fmt=args.image_format,
+        if args.export_image:
+            export_image(
+                outfile=get_path(args.export_image),
+                image=IMAGENAME,
+                fmt=args.image_format,
+                dryrun=dryrun,
+            )
+            sys.exit(0)
+
+        if args.import_image:
+            import_image(infile=get_path(args.import_image), dryrun=dryrun)
+            sys.exit(0)
+
+
+        if args.decrypt_content:
+            if not args.decrypt_to:
+                raise ValueError("--decrypt-content requires --decrypt-to DIR")
+            decrypt_content(
+                infile=get_path(args.decrypt_content),
+                destdir=get_path(args.decrypt_to),
+                dryrun=dryrun,
+            )
+            sys.exit(0)
+
+        if args.workspace_root:
+            workspace_root = get_path(args.workspace_root)
+            validate_workspace_root(workspace_root)
+
+            globalconffile = workspace_root / f"{APPNAME}.json"
+            hostconffile = workspace_root / "host.json"
+            globalconf = load_config(globalconffile, "globalconffile")
+            hostconf = load_config(hostconffile, "hostconffile")
+
+            ansiblefilesdir = workspace_root / "files"
+            ansibleinventoriesdir = workspace_root / "inventories"
+            ansibleplaybooksdir = workspace_root / "playbooks"
+            ansiblerolesdir = workspace_root / "roles"
+            ansiblecollectionsdir = workspace_root / "collections"
+            ansiblelogsdir = workspace_root / "logs"
+
+            ansiblelogsdir.mkdir(parents=True, exist_ok=True)
+        else:
+            globalconffile = get_path(args.globalconffile)
+            hostconffile = get_path(args.hostconffile)
+            globalconf = load_config(globalconffile, "globalconffile")
+            hostconf = load_config(hostconffile, "hostconffile")
+
+            ansiblefilesdir = get_path(globalconf["ansiblefilesdir"])
+            ansibleinventoriesdir = get_path(hostconf["ansibleinventoriesdir"])
+            ansibleplaybooksdir = get_path(globalconf["ansibleplaybooksdir"])
+            ansiblerolesdir = get_path(globalconf["ansiblerolesdir"])
+            ansiblecollectionsdir = get_path(globalconf["ansiblecollectionsdir"])
+            ansiblelogsdir = get_path(globalconf["ansiblelogsdir"])
+
+        ansiblecommand = hostconf["ansiblecommand"]
+
+        if args.encrypt_content:
+            if args.workspace_root:
+                raise ValueError(
+                    "--encypt-content cannot be used with --workspace-root"
+                )
+            logging.info("Running encrypt_content")
+            encrypt_content(
+                outfile=get_path(args.encrypt_content),
+                globalconffile=globalconffile,
+                hostconffile=hostconffile,
+                globalconf=globalconf,
+                hostconf=hostconf,
+                dryrun=dryrun,
+            )
+            sys.exit(0)
+
+        logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
+        logging.info(
+            f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}"
+        )
+        logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
+        logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
+        logging.info(
+            f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}"
+        )
+        logging.info(f"ansiblelogsdir: {shlex.quote(str(ansiblelogsdir))}")
+        logging.info(f"ansiblecommand: {shlex.quote(str(ansiblecommand))}")
+
+        playbook(
+            interactive=args.interactive,
+            globalconffile=globalconffile,
+            hostconffile=hostconffile,
+            ansiblefilesdir=ansiblefilesdir,
+            ansibleinventoriesdir=ansibleinventoriesdir,
+            ansibleplaybooksdir=ansibleplaybooksdir,
+            ansiblerolesdir=ansiblerolesdir,
+            ansiblecollectionsdir=ansiblecollectionsdir,
+            ansiblelogsdir=ansiblelogsdir,
+            ansiblecommand=ansiblecommand,
+            args=passthrough,
             dryrun=dryrun,
         )
-        sys.exit(0)
-
-    if args.import_image:
-        import_image(infile=get_path(args.import_image), dryrun=dryrun)
-        sys.exit(0)
-
-    globalconffile = get_path(args.globalconffile)
-    if not is_readable_file(file=globalconffile):
-        logging.error(
-            f"Config file not found or not readable: {shlex.quote(str(globalconffile))}"
-        )
+    except Exception as exc:
+        logging.error(str(exc))
         sys.exit(1)
-    logging.info(f"globalconffile: {shlex.quote(str(globalconffile))}")
-    globalconf = json.loads(globalconffile.read_text(encoding="utf-8"))
-    logging.info(f"globalconf:\n{json.dumps(globalconf, indent=2)}")
-
-    hostconffile = get_path(args.hostconffile)
-    if not is_readable_file(file=hostconffile):
-        logging.error(
-            f"Config file not found or not readable: {shlex.quote(str(hostconffile))}"
-        )
-        sys.exit(1)
-    logging.info(f"hostconffile: {shlex.quote(str(hostconffile))}")
-    hostconf = json.loads(hostconffile.read_text(encoding="utf-8"))
-    logging.info(f"hostconf:\n{json.dumps(hostconf, indent=2)}")
-
-    ansiblefilesdir = get_path(globalconf["ansiblefilesdir"])
-    ansibleinventoriesdir = get_path(hostconf["ansibleinventoriesdir"])
-    ansibleplaybooksdir = get_path(globalconf["ansibleplaybooksdir"])
-    ansiblerolesdir = get_path(globalconf["ansiblerolesdir"])
-    ansiblecollectionsdir = get_path(globalconf["ansiblecollectionsdir"])
-    ansiblelogsdir = get_path(globalconf["ansiblelogsdir"])
-    ansiblecommand = hostconf["ansiblecommand"]
-
-    logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
-    logging.info(f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}")
-    logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
-    logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
-    logging.info(f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}")
-    logging.info(f"ansiblelogsdir: {shlex.quote(str(ansiblelogsdir))}")
-    logging.info(f"ansiblecommand: {shlex.quote(str(ansiblecommand))}")
-
-    playbook(
-        interactive=args.interactive,
-        globalconffile=globalconffile,
-        hostconffile=hostconffile,
-        ansiblefilesdir=ansiblefilesdir,
-        ansibleinventoriesdir=ansibleinventoriesdir,
-        ansibleplaybooksdir=ansibleplaybooksdir,
-        ansiblerolesdir=ansiblerolesdir,
-        ansiblecollectionsdir=ansiblecollectionsdir,
-        ansiblelogsdir=ansiblelogsdir,
-        ansiblecommand=ansiblecommand,
-        args=passthrough,
-        dryrun=dryrun,
-    )
