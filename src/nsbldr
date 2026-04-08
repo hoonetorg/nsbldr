@@ -18,8 +18,8 @@ import grp
 
 import json
 
-ANSIBLEFILESDIRPATH = "/srv/ansible/files"
 ANSIBLEINVENTORIESDIRPATH = "/srv/ansible/inventories"
+ANSIBLEFILESDIRPATH = "/srv/ansible/files"
 ANSIBLEPLAYBOOKSDIRPATH = "/srv/ansible/playbooks"
 ANSIBLEROLESDIRPATH = "/srv/ansible/roles"
 ANSIBLECOLLECTIONSPATH = "/srv/ansible/collections"
@@ -488,15 +488,15 @@ def main():
     dryrun = False
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-    ansiblefilesdir = get_path(ANSIBLEFILESDIRPATH)
     ansibleinventoriesdir = get_path(ANSIBLEINVENTORIESDIRPATH)
+    ansiblefilesdir = get_path(ANSIBLEFILESDIRPATH)
     ansibleplaybooksdir = get_path(ANSIBLEPLAYBOOKSDIRPATH)
     ansiblerolesdir = get_path(ANSIBLEROLESDIRPATH)
     ansiblecollectionsdir = get_path(ANSIBLECOLLECTIONSPATH)
     ansiblelogsdir = get_path(ANSIBLELOGSDIRPATH)
 
-    logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
     logging.info(f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}")
+    logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
     logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
     logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
     logging.info(f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}")

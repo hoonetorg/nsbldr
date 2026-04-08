@@ -19,8 +19,8 @@ WORKSPACE = Path(f"/{APPNAME}")
 ARCHIVE_MEMBERS = [
     f"{APPNAME}.json",
     "host.json",
-    "files",
     "inventories",
+    "files",
     "playbooks",
     "roles",
     "collections",
@@ -82,8 +82,8 @@ def create_workspace_tar_from_runtime(
     file_map = {
         f"{APPNAME}.json": globalconffile,
         "host.json": hostconffile,
-        "files": get_path(globalconf["ansiblefilesdir"]),
         "inventories": get_path(hostconf["ansibleinventoriesdir"]),
+        "files": get_path(hostconf["ansiblefilesdir"]),
         "playbooks": get_path(globalconf["ansibleplaybooksdir"]),
         "roles": get_path(globalconf["ansiblerolesdir"]),
         "collections": get_path(globalconf["ansiblecollectionsdir"]),
@@ -121,12 +121,12 @@ def encrypt_content(
         f"encrypt_content: wsglobalconf b4:\n{json.dumps(wsglobalconf, indent=2)}"
     )
     logging.info(f"encrypt_content: wshostconf b4:\n{json.dumps(wshostconf, indent=2)}")
-    del wsglobalconf["ansiblerolesdir"]
-    del wsglobalconf["ansibleplaybooksdir"]
-    del wsglobalconf["ansiblecollectionsdir"]
-    del wsglobalconf["ansiblefilesdir"]
-    del wsglobalconf["ansiblelogsdir"]
     del wshostconf["ansibleinventoriesdir"]
+    del wshostconf["ansiblefilesdir"]
+    del wsglobalconf["ansibleplaybooksdir"]
+    del wsglobalconf["ansiblerolesdir"]
+    del wsglobalconf["ansiblecollectionsdir"]
+    del wsglobalconf["ansiblelogsdir"]
     logging.info(
         f"encrypt_content: wsglobalconf after:\n{json.dumps(wsglobalconf, indent=2)}"
     )
@@ -278,8 +278,8 @@ def playbook(
     interactive: bool,
     globalconffile: Path,
     hostconffile: Path,
-    ansiblefilesdir: Path,
     ansibleinventoriesdir: Path,
+    ansiblefilesdir: Path,
     ansibleplaybooksdir: Path,
     ansiblerolesdir: Path,
     ansiblecollectionsdir: Path,
@@ -306,8 +306,8 @@ def playbook(
             f"-w {shlex.quote(str(WORKSPACE))} "
             f"-v {shlex.quote(str(globalconffile))}:/srv/ansible/nsbldr.json:ro,z "
             f"-v {shlex.quote(str(hostconffile))}:/srv/ansible/host.json:ro,z "
-            f"-v {shlex.quote(str(ansiblefilesdir))}:/srv/ansible/files:z "
             f"-v {shlex.quote(str(ansibleinventoriesdir))}:/srv/ansible/inventories:z "
+            f"-v {shlex.quote(str(ansiblefilesdir))}:/srv/ansible/files:z "
             f"-v {shlex.quote(str(ansibleplaybooksdir))}:/srv/ansible/playbooks:z "
             f"-v {shlex.quote(str(ansiblerolesdir))}:/srv/ansible/roles:z "
             f"-v {shlex.quote(str(ansiblecollectionsdir))}:/srv/ansible/collections:z "
@@ -453,8 +453,8 @@ if __name__ == "__main__":
             globalconf = load_config(globalconffile, "globalconffile")
             hostconf = load_config(hostconffile, "hostconffile")
 
-            ansiblefilesdir = workspace_root / "files"
             ansibleinventoriesdir = workspace_root / "inventories"
+            ansiblefilesdir = workspace_root / "files"
             ansibleplaybooksdir = workspace_root / "playbooks"
             ansiblerolesdir = workspace_root / "roles"
             ansiblecollectionsdir = workspace_root / "collections"
@@ -467,8 +467,8 @@ if __name__ == "__main__":
             globalconf = load_config(globalconffile, "globalconffile")
             hostconf = load_config(hostconffile, "hostconffile")
 
-            ansiblefilesdir = get_path(globalconf["ansiblefilesdir"])
             ansibleinventoriesdir = get_path(hostconf["ansibleinventoriesdir"])
+            ansiblefilesdir = get_path(hostconf["ansiblefilesdir"])
             ansibleplaybooksdir = get_path(globalconf["ansibleplaybooksdir"])
             ansiblerolesdir = get_path(globalconf["ansiblerolesdir"])
             ansiblecollectionsdir = get_path(globalconf["ansiblecollectionsdir"])
@@ -492,10 +492,10 @@ if __name__ == "__main__":
             )
             sys.exit(0)
 
-        logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
         logging.info(
             f"ansibleinventoriesdir: {shlex.quote(str(ansibleinventoriesdir))}"
         )
+        logging.info(f"ansiblefilesdir: {shlex.quote(str(ansiblefilesdir))}")
         logging.info(f"ansibleplaybooksdir: {shlex.quote(str(ansibleplaybooksdir))}")
         logging.info(f"ansiblerolesdir: {shlex.quote(str(ansiblerolesdir))}")
         logging.info(
@@ -508,8 +508,8 @@ if __name__ == "__main__":
             interactive=args.interactive,
             globalconffile=globalconffile,
             hostconffile=hostconffile,
-            ansiblefilesdir=ansiblefilesdir,
             ansibleinventoriesdir=ansibleinventoriesdir,
+            ansiblefilesdir=ansiblefilesdir,
             ansibleplaybooksdir=ansibleplaybooksdir,
             ansiblerolesdir=ansiblerolesdir,
             ansiblecollectionsdir=ansiblecollectionsdir,
