@@ -232,7 +232,7 @@ def export_image(
     fmt: str = "oci-archive",
     dryrun: bool = False,
 ):
-    """Export a local Podman image to an archive (for offline USB media)."""
+    """Export a local Podman image to an archive."""
     outfile.parent.mkdir(parents=True, exist_ok=True)
     subprocess_run_wrapper(
         cmd=(
