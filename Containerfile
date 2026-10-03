@@ -9,6 +9,7 @@ RUN apt-get update \
         ansible \
         ansible-core \
         python3-paramiko \
+        python3-xmltodict \
         openssh-client \
         sshpass \
         sudo \
