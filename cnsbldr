@@ -84,6 +84,7 @@ def create_workspace_tar_from_runtime(
         "host.json": hostconffile,
         "inventories": get_path(hostconf["ansibleinventoriesdir"]),
         "files": get_path(hostconf["ansiblefilesdir"]),
+        "largefiles": get_path(hostconf["ansiblelargefilesdir"]),
         "playbooks": get_path(globalconf["ansibleplaybooksdir"]),
         "roles": get_path(globalconf["ansiblerolesdir"]),
         "collections": get_path(globalconf["ansiblecollectionsdir"]),
@@ -123,6 +124,7 @@ def encrypt_content(
     logging.info(f"encrypt_content: wshostconf b4:\n{json.dumps(wshostconf, indent=2)}")
     del wshostconf["ansibleinventoriesdir"]
     del wshostconf["ansiblefilesdir"]
+    del wshostconf["ansiblelargefilesdir"]
     del wsglobalconf["ansibleplaybooksdir"]
     del wsglobalconf["ansiblerolesdir"]
     del wsglobalconf["ansiblecollectionsdir"]
@@ -284,6 +286,7 @@ def playbook(
     ansiblerolesdir: Path,
     ansiblecollectionsdir: Path,
     ansiblelogsdir: Path,
+    ansiblelargefilesdir: Path,
     ansiblecommand: str,
     args: list,
     dryrun: bool = False,
@@ -308,6 +311,7 @@ def playbook(
             f"-v {shlex.quote(str(hostconffile))}:/srv/ansible/host.json:ro,z "
             f"-v {shlex.quote(str(ansibleinventoriesdir))}:/srv/ansible/inventories:z "
             f"-v {shlex.quote(str(ansiblefilesdir))}:/srv/ansible/files:z "
+            f"-v {shlex.quote(str(ansiblelargefilesdir))}:/srv/ansible/largefiles:z "
             f"-v {shlex.quote(str(ansibleplaybooksdir))}:/srv/ansible/playbooks:z "
             f"-v {shlex.quote(str(ansiblerolesdir))}:/srv/ansible/roles:z "
             f"-v {shlex.quote(str(ansiblecollectionsdir))}:/srv/ansible/collections:z "
@@ -459,6 +463,7 @@ if __name__ == "__main__":
             ansiblerolesdir = workspace_root / "roles"
             ansiblecollectionsdir = workspace_root / "collections"
             ansiblelogsdir = workspace_root / "logs"
+            ansiblelargefilesdir = workspace_root / "largefiles"
 
             ansiblelogsdir.mkdir(parents=True, exist_ok=True)
         else:
@@ -469,6 +474,7 @@ if __name__ == "__main__":
 
             ansibleinventoriesdir = get_path(hostconf["ansibleinventoriesdir"])
             ansiblefilesdir = get_path(hostconf["ansiblefilesdir"])
+            ansiblelargefilesdir = get_path(hostconf["ansiblelargefilesdir"])
             ansibleplaybooksdir = get_path(globalconf["ansibleplaybooksdir"])
             ansiblerolesdir = get_path(globalconf["ansiblerolesdir"])
             ansiblecollectionsdir = get_path(globalconf["ansiblecollectionsdir"])
@@ -502,6 +508,7 @@ if __name__ == "__main__":
             f"ansiblecollectionsdir: {shlex.quote(str(ansiblecollectionsdir))}"
         )
         logging.info(f"ansiblelogsdir: {shlex.quote(str(ansiblelogsdir))}")
+        logging.info(f"ansiblelargefilesdir: {shlex.quote(str(ansiblelargefilesdir))}")
         logging.info(f"ansiblecommand: {shlex.quote(str(ansiblecommand))}")
 
         playbook(
@@ -514,6 +521,7 @@ if __name__ == "__main__":
             ansiblerolesdir=ansiblerolesdir,
             ansiblecollectionsdir=ansiblecollectionsdir,
             ansiblelogsdir=ansiblelogsdir,
+            ansiblelargefilesdir=ansiblelargefilesdir,
             ansiblecommand=ansiblecommand,
             args=passthrough,
             dryrun=dryrun,
