@@ -305,6 +305,9 @@ def playbook(
             "--network=host "
             "--user=root "
             "--group-add=root "
+            # no copy of the container output in the journal (podman's default log driver): it would keep
+            # everything shown on screen, e.g. decrypted vault values from ansible-inventory, after --rm
+            "--log-driver=none "
             f"{ctrargs}"
             f"-w {shlex.quote(str(WORKSPACE))} "
             f"-v {shlex.quote(str(globalconffile))}:/srv/ansible/nsbldr.json:ro,z "
