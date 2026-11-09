@@ -1,0 +1,17 @@
+#!/bin/sh
+# nsbldr-init <command> [args]
+# Adds the CA certificates cnsbldr mounted as anchors (host.json "cacerts") to the system trust
+# store, points Python requests (platform CLIs) at the merged system bundle, then runs the command.
+# Public CAs stay trusted. Needs root (cnsbldr runs the container with --user=root).
+if ls /etc/pki/ca-trust/source/anchors/nsbldr-* >/dev/null 2>&1; then
+  if ! update-ca-trust extract >/dev/null 2>&1; then
+    echo "nsbldr-init: update-ca-trust failed for the CA certificates from cacerts" >&2
+    exit 1
+  fi
+fi
+export REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+if [ $# -eq 0 ]; then
+  echo "usage: nsbldr-init <command> [args]" >&2
+  exit 2
+fi
+exec "$@"

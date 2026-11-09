@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""ctlenv <command> [args]
+
+Runs <command> with the automation platform connection (AWX / AAP / clones) taken from the config file
+cnsbldr mounts (host.json "controllerconfigfile"): ~/.tower_cli.cfg or ~/.controller_cli.cfg,
+section [general] (optional) with host, username, password, oauth_token / token, verify_ssl.
+
+The values are put into CONTROLLER_* variables of this process only, then <command> replaces it (exec).
+Nothing is printed; error messages name keys and files, never values. So secrets don't have to be
+passed as podman -e (visible in `podman inspect`) or as command line arguments (visible in logs/ps).
+"""
+import configparser
+import os
+import sys
+from pathlib import Path
+
+FILES = [Path.home() / ".tower_cli.cfg", Path.home() / ".controller_cli.cfg"]
+KEYS = {
+    "host": ["CONTROLLER_HOST"],
+    "username": ["CONTROLLER_USERNAME"],
+    "password": ["CONTROLLER_PASSWORD"],
+    "oauth_token": ["CONTROLLER_OAUTH_TOKEN", "CONTROLLER_TOKEN"],
+    "token": ["CONTROLLER_OAUTH_TOKEN", "CONTROLLER_TOKEN"],
+    "verify_ssl": ["CONTROLLER_VERIFY_SSL"],
+}
+
+
+def die(msg: str, rc: int = 2):
+    print(f"ctlenv: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+    if len(sys.argv) < 2:
+        die("usage: ctlenv <command> [args]")
+    cfgfile = next((f for f in FILES if f.is_file()), None)
+    if cfgfile is None:
+        die(f"no config file ({' or '.join(str(f) for f in FILES)}); set controllerconfigfile in host.json")
+    parser = configparser.ConfigParser(interpolation=None)
+    text = cfgfile.read_text()
+    try:
+        # like the platform modules: a file without section header counts as [general]
+        parser.read_string(text if text.lstrip().startswith("[") else "[general]\n" + text)
+    except configparser.Error:
+        die(f"{cfgfile}: not an ini file")
+    if not parser.has_section("general"):
+        die(f"{cfgfile}: no [general] section")
+    env = dict(os.environ)
+    for key, names in KEYS.items():
+        value = parser.get("general", key, fallback=None)
+        if value:
+            for name in names:
+                env[name] = value
+    if "CONTROLLER_HOST" not in env:
+        die(f"{cfgfile}: no host")
+    try:
+        os.execvpe(sys.argv[1], sys.argv[1:], env)
+    except OSError as exc:
+        die(f"cannot run {sys.argv[1]}: {exc.strerror}", 127)
+
+
+if __name__ == "__main__":
+    main()

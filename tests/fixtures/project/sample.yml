@@ -1,0 +1,67 @@
+---
+# Generic sample run, used by standalone-vs-ee.sh and smoke.sh. Deterministic in a fresh container:
+# same task results whether run by ansible-playbook (cnsbldr) or by ansible-runner (EE in a platform).
+- name: nsbldr sample
+  hosts: all
+  gather_facts: true
+  vars:
+    sample_dir: /tmp/nsbldr-sample
+  tasks:
+    - name: Directory (changed)
+      ansible.builtin.file:
+        path: "{{ sample_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Template (changed)
+      ansible.builtin.template:
+        src: sample.conf.j2
+        dest: "{{ sample_dir }}/sample.conf"
+        mode: "0644"
+
+    - name: Template again (ok)
+      ansible.builtin.template:
+        src: sample.conf.j2
+        dest: "{{ sample_dir }}/sample.conf"
+        mode: "0644"
+
+    - name: Ini file (community.general, changed)
+      community.general.ini_file:
+        path: "{{ sample_dir }}/sample.ini"
+        section: s
+        option: o
+        value: v
+        mode: "0644"
+
+    - name: Filters from the collections
+      ansible.builtin.set_fact:
+        sample_filters:
+          from_xml: "{{ '<a><b>1</b></a>' | ansible.utils.from_xml }}"
+          ipaddr: "{{ '10.0.0.1/24' | ansible.utils.ipaddr('network') }}"
+          in_network: "{{ '10.0.0.1' is ansible.utils.in_network('10.0.0.0/8') }}"
+          dict_kv: "{{ 'v' | community.general.dict_kv('k') }}"
+          version_sort: "{{ ['1.10', '1.2'] | community.general.version_sort }}"
+
+    - name: Show filter results
+      ansible.builtin.debug:
+        var: sample_filters
+
+    - name: Facts were gathered
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution | length > 0
+          - ansible_facts.python.version.major == 3
+
+    - name: Command (ok, changed_when false)
+      ansible.builtin.command: cat {{ sample_dir }}/sample.conf
+      changed_when: false
+      register: sample_cat
+
+    - name: Content as expected
+      ansible.builtin.assert:
+        that: "'sample_value=42' in sample_cat.stdout"
+
+    - name: Only with sample_extra (skipped by default)
+      ansible.builtin.debug:
+        msg: extra
+      when: sample_extra | default(false) | bool

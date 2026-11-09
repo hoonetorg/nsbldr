@@ -1,0 +1,17 @@
+# Python packages on top of the base image. Exact pins only: the build must be reproducible.
+# If pip has to change other packages of the base image because of these pins, pin them here too
+# (tests/image.sh fails otherwise, see tests/README.md "Updating pins"). Currently none.
+
+ansible-core==2.21.6      # targets Python 3.9-3.14, maintained until Nov 2027; 2.22+ needs Python >= 3.13
+
+# awx CLI. awxkit 24.6.1 from PyPI crashes on Python 3.12's argparse; fixed in AWX devel.
+awxkit @ git+https://github.com/ansible/awx.git@5054397c26b924868063ed3f62d8d4cd359f77a4#subdirectory=awxkit
+ascender-kit==25.6.1      # ascender CLI (newest release <= Ascender 25.6.2)
+
+# ssh transport for network_cli (RouterOS): ansible-core 2.21 removed the paramiko connection plugin,
+# network_cli uses libssh when this is installed ([libssh_connection] in src/ansible.cfg)
+ansible-pylibssh==1.4.0
+
+# already in the base image, listed so the build fails if a future base drops them
+xmltodict                 # ansible.utils.from_xml
+netaddr                   # ansible.utils ipaddr/ipv4/in_network

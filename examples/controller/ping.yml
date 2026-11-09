@@ -1,0 +1,24 @@
+---
+# Read-only smoke test against AWX / Ascender / AAP.
+# Connection from ~/.tower_cli.cfg (host.json: controllerconfigfile) or CONTROLLER_* env vars.
+# Switch the collection in BOTH places: collections line and ctl var
+#   awx.awx | ctrliq.ascender | ansible.controller
+- name: Ask the automation platform who it is
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - awx.awx
+  vars:
+    ctl: awx.awx
+  tasks:
+    - name: Platform meta data (version, type)
+      controller_meta:
+      register: meta
+
+    - name: Show meta data
+      ansible.builtin.debug:
+        var: meta
+
+    - name: List organizations
+      ansible.builtin.debug:
+        msg: "{{ query(ctl ~ '.controller_api', 'organizations') | map(attribute='name') | list }}"

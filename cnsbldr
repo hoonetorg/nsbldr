@@ -16,6 +16,31 @@ APPNAME = "nsbldr"
 IMAGENAME = APPNAME
 CONTAINERFILE = "Containerfile"
 WORKSPACE = Path(f"/{APPNAME}")
+DEFAULT_ENTRYPOINT = "ansible-playbook"
+# optional host.json keys: host files mounted read-only into the container (never packed by --encrypt-content)
+OPTIONAL_HOSTCONF_FILES = {
+    # [general] host/username/password/oauth_token/verify_ssl for AWX / AAP / clones: read by the platform
+    # modules (one collection reads ~/.tower_cli.cfg, another ~/.controller_cli.cfg); for the platform CLIs
+    # (env only) run them through `ctlenv`
+    "controllerconfigfile": ["/root/.tower_cli.cfg", "/root/.controller_cli.cfg"],
+    # kubeconfig for kubectl / oc
+    "kubeconfigfile": ["/root/.kube/config"],
+}
+# optional host.json key: CA certificates (files and/or directories with *.crt / *.pem) added to the
+# container's trust store at start (nsbldr-init in the image), in addition to the public CAs
+CACERTS_KEY = "cacerts"
+CA_ANCHORS_DIR = "/etc/pki/ca-trust/source/anchors"
+INIT_ENTRYPOINT = "nsbldr-init"
+LOCAL_ONLY_HOSTCONF_KEYS = [*OPTIONAL_HOSTCONF_FILES, CACERTS_KEY]
+# passed into the container only if set on the host
+PASSTHROUGH_ENV = [
+    "CONTROLLER_HOST",
+    "CONTROLLER_USERNAME",
+    "CONTROLLER_PASSWORD",
+    "CONTROLLER_OAUTH_TOKEN",
+    "CONTROLLER_TOKEN",
+    "CONTROLLER_VERIFY_SSL",
+]
 ARCHIVE_MEMBERS = [
     f"{APPNAME}.json",
     "host.json",
@@ -129,6 +154,8 @@ def encrypt_content(
     del wsglobalconf["ansiblerolesdir"]
     del wsglobalconf["ansiblecollectionsdir"]
     del wsglobalconf["ansiblelogsdir"]
+    for key in LOCAL_ONLY_HOSTCONF_KEYS:
+        wshostconf.pop(key, None)
     logging.info(
         f"encrypt_content: wsglobalconf after:\n{json.dumps(wsglobalconf, indent=2)}"
     )
@@ -216,11 +243,11 @@ def decrypt_content(infile: Path, destdir: Path, dryrun: bool = False):
         validate_workspace_root(destdir)
 
 
-def build_image(sourcedir: Path, dryrun: bool = False):
+def build_image(sourcedir: Path, image: str = IMAGENAME, dryrun: bool = False):
     subprocess_run_wrapper(
         cmd=(
             "podman build "
-            f"-t {shlex.quote(IMAGENAME)} "
+            f"-t {shlex.quote(image)} "
             f"-f {shlex.quote(str(sourcedir / Path(CONTAINERFILE)))}"
         ),
         dryrun=dryrun,
@@ -289,19 +316,48 @@ def playbook(
     ansiblelargefilesdir: Path,
     ansiblecommand: str,
     args: list,
+    image: str = IMAGENAME,
+    entrypoint: str = DEFAULT_ENTRYPOINT,
+    optionalmounts: list | None = None,
     dryrun: bool = False,
 ):
+    optionalmounts = optionalmounts or []
+    # CA certificates need the trust store updated at start: nsbldr-init runs first, then the command
+    use_init = any(dst.startswith(f"{CA_ANCHORS_DIR}/") for _, dst in optionalmounts)
+
     ctrargs = "--rm "
     if interactive:
-        ctrargs += "-it --entrypoint /bin/bash "
+        command = "/bin/bash"
+        tty = "-it "
         logging.info(f"ansiblecommand:  {shlex.quote(str(ansiblecommand))}")
+    elif entrypoint != DEFAULT_ENTRYPOINT:
+        command = entrypoint
+        # tty only when attached to a terminal, so output can be piped (e.g. awx ... | jq)
+        tty = "-it " if sys.stdin.isatty() and sys.stdout.isatty() else "-i "
+    else:
+        # always explicit: images built on an execution environment keep the EE's entrypoint
+        command = entrypoint
+        tty = ""
+    if use_init:
+        ctrargs += f"{tty}--entrypoint {INIT_ENTRYPOINT} "
+        args = [command, *args]
+    else:
+        ctrargs += f"{tty}--entrypoint {shlex.quote(command)} "
+
+    for src, dst in optionalmounts:
+        ctrargs += f"-v {shlex.quote(str(src))}:{shlex.quote(dst)}:ro,z "
+
+    for name in PASSTHROUGH_ENV:
+        if name in os.environ:
+            # name only: podman takes the value from the host environment (keeps secrets off the command line/log)
+            ctrargs += f"-e {name} "
 
     subprocess_run_wrapper(
         cmd=(
             "podman "
             "run "
             "--pids-limit=-1 "
-            f"--name {shlex.quote(str(IMAGENAME))} "
+            f"--name {shlex.quote(container_name(image))} "
             "--network=host "
             "--user=root "
             "--group-add=root "
@@ -319,12 +375,49 @@ def playbook(
             f"-v {shlex.quote(str(ansiblerolesdir))}:/srv/ansible/roles:z "
             f"-v {shlex.quote(str(ansiblecollectionsdir))}:/srv/ansible/collections:z "
             f"-v {shlex.quote(str(ansiblelogsdir))}:/srv/ansible/logs:z "
-            f"{shlex.quote(str(IMAGENAME))} "
+            f"{shlex.quote(str(image))} "
             f"{' '.join(shlex.quote(a) for a in args)}"
         ),
         dryrun=dryrun,
         check=True,
     )
+
+
+def container_name(image: str) -> str:
+    # 'nsbldr' -> 'nsbldr', 'nsbldr:ascender-ee' -> 'nsbldr-ascender-ee': different images can run side by side
+    return image.rsplit("/", 1)[-1].replace(":", "-")
+
+
+def get_ca_files(value) -> list[Path]:
+    """cacerts value (path or list of paths; files or directories) -> certificate files"""
+    files = []
+    for item in [value] if isinstance(value, str) else value:
+        path = get_path(item)
+        if path.is_dir():
+            found = sorted(p for p in path.iterdir() if p.suffix in (".crt", ".pem") and is_readable_file(p))
+            if not found:
+                raise FileNotFoundError(f"host.json {CACERTS_KEY}: no readable *.crt / *.pem in {path}")
+            files.extend(found)
+        elif is_readable_file(path):
+            files.append(path)
+        else:
+            raise FileNotFoundError(f"host.json {CACERTS_KEY}: file not found or not readable: {path}")
+    return files
+
+
+def get_optional_mounts(hostconf: dict) -> list[tuple[Path, str]]:
+    """(host file, container path) pairs for the optional host.json keys, all mounted read-only"""
+    mounts = []
+    for key, dsts in OPTIONAL_HOSTCONF_FILES.items():
+        if hostconf.get(key):
+            src = get_path(hostconf[key])
+            if not is_readable_file(src):
+                raise FileNotFoundError(f"host.json {key}: file not found or not readable: {src}")
+            mounts.extend((src, dst) for dst in dsts)
+    if hostconf.get(CACERTS_KEY):
+        for n, src in enumerate(get_ca_files(hostconf[CACERTS_KEY]), start=1):
+            mounts.append((src, f"{CA_ANCHORS_DIR}/nsbldr-{n}-{src.name}"))
+    return mounts
 
 
 def load_config(configfile: Path, label: str) -> dict:
@@ -343,6 +436,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run nsbldr in container")
     parser.add_argument(
         "--build", action="store_true", help=f"Build {IMAGENAME} container"
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=IMAGENAME,
+        help=f"Container image name[:tag] for build, export and run (default '{IMAGENAME}')",
+    )
+    parser.add_argument(
+        "--entrypoint",
+        type=str,
+        default=DEFAULT_ENTRYPOINT,
+        help=(
+            f"Command run in the container (default '{DEFAULT_ENTRYPOINT}'), "
+            "e.g. ansible, ansible-galaxy, ansible-doc, ctlenv, oc, kubectl, python3"
+        ),
     )
     parser.add_argument(
         "--sourcedir",
@@ -424,13 +532,13 @@ if __name__ == "__main__":
 
     try:
         if args.build:
-            build_image(sourcedir=sourcedir, dryrun=dryrun)
+            build_image(sourcedir=sourcedir, image=args.image, dryrun=dryrun)
             sys.exit(0)
 
         if args.export_image:
             export_image(
                 outfile=get_path(args.export_image),
-                image=IMAGENAME,
+                image=args.image,
                 fmt=args.image_format,
                 dryrun=dryrun,
             )
@@ -527,6 +635,9 @@ if __name__ == "__main__":
             ansiblelargefilesdir=ansiblelargefilesdir,
             ansiblecommand=ansiblecommand,
             args=passthrough,
+            image=args.image,
+            entrypoint=args.entrypoint,
+            optionalmounts=get_optional_mounts(hostconf),
             dryrun=dryrun,
         )
     except Exception as exc:

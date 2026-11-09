@@ -1,0 +1,16 @@
+---
+# Collections on top of the base image (the platform collections awx.awx, ctrliq.ascender,
+# community.general, ansible.posix, ansible.utils, ... come with the base and keep its versions).
+collections:
+  - name: community.crypto
+    version: "3.0.3"
+  - name: ansible.netcommon
+    version: "8.1.0"
+  - name: community.routeros
+    version: "3.10.0"
+  # AAP collections need Automation Hub access / a subscription. Download the tarballs into
+  # requirements/ and enable:
+  # - name: /tmp/req/ansible-controller-X.Y.Z.tar.gz
+  #   type: file
+  # - name: /tmp/req/ansible-platform-X.Y.Z.tar.gz
+  #   type: file

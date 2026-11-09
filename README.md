@@ -33,3 +33,119 @@ encrypted bundle (`largefiles/`), so a bundle on a stick carries everything need
 
 One directory per environment keeps environments apart, e.g.
 `/srv/work/nsbldr/secretenv2-ansiblelargefiles/desktops-vienna` and `.../desktops-newyork`.
+
+## Ansible and content
+
+- ansible-core 2.21 (Python 3.12): targets with Python 3.9 - 3.14, maintained until Nov 2027
+- collections for desktop and network automation (community.general, community.crypto, ansible.posix,
+  ansible.utils, ansible.netcommon, community.routeros) and for configuring automation platforms
+  (projects, inventories, job templates, workflows as code)
+- network devices (`network_cli`, e.g. RouterOS): ssh via libssh (`ansible-pylibssh`), ansible-core
+  2.21 has no paramiko connection anymore; password auth without trying keys:
+  `[libssh_connection] look_for_keys = False` in `src/ansible.cfg`
+- CLIs: `awx` and the platform CLIs listed in `requirements/requirements.txt`, `kubectl`, `oc`
+  (e.g. in `--interactive`)
+- AAP's own CLI and collections need a subscription: optional hooks in `Containerfile` and
+  `requirements/collections.yml`
+- everything is pinned (`Containerfile` ARGs, `requirements/`); nothing changes without changing a pin
+
+## Two modes, same results
+
+- standalone with `cnsbldr` (config files, mapped folders), as before
+- as execution environment in an automation platform: the image keeps the execution environment's
+  entrypoint, user and ansible-runner, so it can be registered there and runs the same playbooks with
+  the same Ansible. `tests/standalone-vs-ee.sh` checks that both modes give the same task results.
+
+## Image name: `--image`
+
+`--image NAME[:TAG]` (default `nsbldr`) is used by `--build`, `--export-image` and for running. The
+container name follows the image (`nsbldr:test` -> `nsbldr-test`), so different images can run side
+by side.
+
+```
+./cnsbldr --image nsbldr:test --build
+./cnsbldr --image nsbldr:test --export-image ~/nsbldr-test.ctr
+```
+
+## Other commands: `--entrypoint`
+
+Default is `ansible-playbook` (always passed explicitly, the image keeps the execution environment's
+entrypoint); all other arguments are passed through as before. For other commands a tty is only
+allocated when attached to a terminal, so output can be piped.
+
+```
+./cnsbldr --entrypoint ansible --version
+./cnsbldr --entrypoint ansible-doc <collection>.<module>
+./cnsbldr --entrypoint ctlenv awx projects list -f human
+./cnsbldr --entrypoint kubectl get pods -n <namespace>
+```
+
+## Automation platform access
+
+Optional keys in the host config file. Mounted read-only, never packed by `--encrypt-content`:
+
+```json
+"controllerconfigfile": "~/.config/nsbldr/platform.cfg",
+"kubeconfigfile": "~/.config/nsbldr/kubeconfig",
+"cacerts": ["~/.config/nsbldr/customer-ca.crt", "~/.config/nsbldr/cas/"]
+```
+
+- `controllerconfigfile`: platform connection, mounted as `~/.tower_cli.cfg` and
+  `~/.controller_cli.cfg` (the platform collections read one or the other)
+
+  ```ini
+  [general]
+  host = https://platform.example.internal
+  oauth_token = xxxxx          # or username / password
+  verify_ssl = true            # false only for test servers
+  ```
+
+- `kubeconfigfile`: kubeconfig for `kubectl` / `oc` (CA or `insecure-skip-tls-verify` per cluster in
+  the file). Without it, `oc login` in `--interactive` keeps its token only in the container.
+- `cacerts`: CA certificate files and/or directories (`*.crt`, `*.pem`), e.g. internal CAs. They are
+  added to the container's trust store at start, the public CAs stay. All tools use the merged store
+  (Ansible incl. platform modules, curl, git, kubectl/oc without CA in the kubeconfig, platform CLIs).
+  Independent of the trust store of the machine you run cnsbldr on.
+
+Which tool reads what:
+
+| tool | connection | CA |
+|---|---|---|
+| platform modules (playbooks) | `controllerconfigfile` or `CONTROLLER_*` env | system trust store (+ `cacerts`), `verify_ssl` |
+| platform CLIs (`awx`, ...) | `CONTROLLER_*` env only: run them through `ctlenv` | system trust store (+ `cacerts`), `verify_ssl` |
+| `kubectl`, `oc` | `kubeconfigfile` | kubeconfig, else system trust store (+ `cacerts`) |
+
+`ctlenv <command>` sets the `CONTROLLER_*` variables from the mounted config file for that command
+only and prints nothing. The `awx` CLI uses username / password (no token), other platform CLIs also
+the token.
+
+`CONTROLLER_HOST`, `CONTROLLER_USERNAME`, `CONTROLLER_PASSWORD`, `CONTROLLER_OAUTH_TOKEN`,
+`CONTROLLER_TOKEN` and `CONTROLLER_VERIFY_SSL` set on the host are passed into the container by name,
+so the values are not in the logged podman command - but visible in `podman inspect` while the
+container runs. The config file is the better way.
+
+Read-only smoke test: `examples/controller/ping.yml` (copy it into the playbooks dir).
+
+## Secrets
+
+- cnsbldr runs every container with `--log-driver=none`: no container output in the journal or
+  `podman logs`; podman events record no arguments, environment or output
+- the platform modules hide password and token (`no_log`), also with `-vvv`; `tests/secrets.sh` checks
+  that no credential shows up in any output or log
+- still logged by Ansible (`log_path`, per-host `log_plays`): whatever a playbook prints - `debug` of
+  secrets, `--diff` of files with secrets, `ansible-inventory` output (decrypted vault values)
+- no secrets as command line arguments (`--conf.password`, `oc login -p`, `-e password=...`): cnsbldr
+  prints the podman command including them, `ps` shows them
+- no secrets via `export X=value` in the shell (history); `read -rs X; export X` or the config file
+- no high verbosity with real credentials (`awx -v`, `kubectl -v=8` and higher)
+- prefer personal tokens with limited rights and expiry over admin passwords
+
+## Rootless podman with domain users
+
+Domain users usually have no `/etc/subuid` range. Podman then warns and uses a single UID mapping
+(container root = your user), which is fine for this image. For full mappings an admin adds
+`<user>:100000:65536` to `/etc/subuid` and `/etc/subgid`, then runs `podman system migrate`.
+
+## Tests
+
+`tests/run.sh` - see [tests/README.md](tests/README.md).
