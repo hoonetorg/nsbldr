@@ -5,9 +5,13 @@ source "$(dirname "$0")/common.sh"
 rm -rf "$WORK_DIR/logs"; mkdir -p "$WORK_DIR/logs"
 : > "$WORK_DIR/summary.txt"
 rc=0
-for t in cnsbldr image platform smoke standalone-vs-ee cacerts secrets; do
+for t in cnsbldr cnsbldr-py39 image platform smoke standalone-vs-ee cacerts secrets; do
   case $t in
     cnsbldr) cmd=(python3 "$TESTS_DIR/test_cnsbldr.py" -v) ;;
+    # cnsbldr runs on the host: EL9 has python3.9 (the nsbldr image is Rocky 9 and has it too)
+    cnsbldr-py39) cmd=("$CONTAINER_ENGINE" run --rm --log-driver=none --network=none --user root -e PYTHONDONTWRITEBYTECODE=1
+                       -v "$REPO_DIR:/r:ro,z" --entrypoint sh "$IMAGE" -c
+                       'python3.9 /r/cnsbldr --help >/dev/null && python3.9 /r/tests/test_cnsbldr.py -v') ;;
     *)       cmd=(bash "$TESTS_DIR/$t.sh") ;;
   esac
   start=$SECONDS

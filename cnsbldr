@@ -54,7 +54,7 @@ ARCHIVE_MEMBERS = [
 
 def subprocess_run_wrapper(
     cmd: str, dryrun: bool = False, **kwargs
-) -> subprocess.CompletedProcess | None:
+) -> "subprocess.CompletedProcess | None":
     if kwargs.get("shell"):
         wcmd = cmd
     else:
@@ -318,7 +318,7 @@ def playbook(
     args: list,
     image: str = IMAGENAME,
     entrypoint: str = DEFAULT_ENTRYPOINT,
-    optionalmounts: list | None = None,
+    optionalmounts: "list | None" = None,
     dryrun: bool = False,
 ):
     optionalmounts = optionalmounts or []
