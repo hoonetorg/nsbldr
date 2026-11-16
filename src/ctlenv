@@ -11,6 +11,7 @@ passed as podman -e (visible in `podman inspect`) or as command line arguments (
 """
 import configparser
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -42,8 +43,10 @@ def main():
     parser = configparser.ConfigParser(interpolation=None)
     text = cfgfile.read_text()
     try:
-        # like the platform modules: a file without section header counts as [general]
-        parser.read_string(text if text.lstrip().startswith("[") else "[general]\n" + text)
+        # like the platform modules: a file without any section header counts as [general]
+        # (comments before the first section are fine)
+        has_section = re.search(r"^\s*\[[^\]]+\]", text, re.MULTILINE)
+        parser.read_string(text if has_section else "[general]\n" + text)
     except configparser.Error:
         die(f"{cfgfile}: not an ini file")
     if not parser.has_section("general"):
