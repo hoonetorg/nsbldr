@@ -33,3 +33,14 @@ mk_ws() {
 cn() { local d=$1; shift; "$REPO_DIR/cnsbldr" --image "${IMAGE#localhost/}" --globalconffile "$d/nsbldr.json" --hostconffile "$d/host.json" "$@"; }
 # a TCP port on 127.0.0.1 where nothing listens
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+# vault_encrypt <password> <file...>: ansible-vault encrypt in the image, files replaced (test password via env)
+vault_encrypt() {
+  local pw=$1 f; shift
+  for f in "$@"; do
+    VPW=$pw ctr -i --network=none --user root -e VPW --entrypoint sh "$IMAGE" -c \
+      'printf "%s\n" "$VPW" > /tmp/p && ansible-vault encrypt --vault-password-file /tmp/p --output - - 2>/dev/null' < "$f" > "$f.enc"
+    mv "$f.enc" "$f"
+  done
+}
+# withpw <password> <command...>: the command on a terminal, password typed at the "Vault password:" prompt
+withpw() { python3 "$TESTS_DIR/withpw.py" "$@"; }

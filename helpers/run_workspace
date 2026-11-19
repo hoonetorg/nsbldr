@@ -1,0 +1,25 @@
+#!/bin/bash
+
+if [ "`id -u`" != "1000" ]; then
+  echo "user must be standard local admin - exiting"
+  exit 1
+fi
+
+NSBASE=""
+if [ -d "/media/`id -un`/EXTRA" ]; then
+  NSBASE="/media/`id -un`/EXTRA"
+elif [ -d "/run/media/`id -un`/EXTRA" ]; then
+  NSBASE="/run/media/`id -un`/EXTRA"	
+fi
+
+if [ -z "$NSBASE" ]; then
+  echo "no nsbldr workspace"
+  exit 1
+fi
+
+${NSBASE}/nsbldr/cnsbldr --import-image ${NSBASE}/nsbldr.ctr 
+${NSBASE}/nsbldr/cnsbldr --decrypt-content ${NSBASE}/nsbldrws.gpg.enc --decrypt-to ~/nsbldrws
+${NSBASE}/nsbldr/cnsbldr --workspace-root ~/nsbldrws --interactive
+
+echo "In interactive container pls run a command like:"
+echo "ansible-playbook -v -i /srv/ansible/inventories/<inventory> -k -K --ask-vault-password /srv/ansible/playbooks/ansible-playbook-desktop/site.yml -l <mandatory-limit-profile>"

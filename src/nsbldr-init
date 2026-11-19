@@ -1,8 +1,17 @@
 #!/bin/sh
 # nsbldr-init <command> [args]
-# Adds the CA certificates cnsbldr mounted as anchors (host.json "cacerts") to the system trust
-# store, points Python requests (platform CLIs) at the merged system bundle, then runs the command.
-# Public CAs stay trusted. Needs root (cnsbldr runs the container with --user=root).
+# Started by cnsbldr when host.json has platform access keys. Needs root (cnsbldr runs the container with
+# --user=root).
+# 1. Adds the CA certificates cnsbldr mounted as anchors (host.json "cacerts") to the system trust store and
+#    points Python requests (platform CLIs) at the merged system bundle. Public CAs stay trusted.
+# 2. Encrypted access files (ansible-vault, mounted under /srv/ansible/access): asks once for the vault
+#    password, keeps it in /run/nsbldr (tmpfs, RAM only) for ansible / ansible-vault
+#    (ANSIBLE_VAULT_PASSWORD_FILE), decrypts the files there and links them where the tools look.
+# 3. Runs the command, through ctlenv if there is a platform config (CONTROLLER_* for everything it starts).
+if [ $# -eq 0 ]; then
+  echo "usage: nsbldr-init <command> [args]" >&2
+  exit 2
+fi
 if ls /etc/pki/ca-trust/source/anchors/nsbldr-* >/dev/null 2>&1; then
   if ! update-ca-trust extract >/dev/null 2>&1; then
     echo "nsbldr-init: update-ca-trust failed for the CA certificates from cacerts" >&2
@@ -10,8 +19,38 @@ if ls /etc/pki/ca-trust/source/anchors/nsbldr-* >/dev/null 2>&1; then
   fi
 fi
 export REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
-if [ $# -eq 0 ]; then
-  echo "usage: nsbldr-init <command> [args]" >&2
-  exit 2
+
+if ls /srv/ansible/access/* >/dev/null 2>&1; then
+  if [ ! -t 0 ]; then
+    echo "nsbldr-init: vault password needed but no terminal" >&2
+    exit 1
+  fi
+  old=$(stty -g)
+  trap 'stty "$old"; exit 130' INT TERM
+  stty -echo
+  printf 'Vault password: '
+  IFS= read -r pw
+  stty "$old"
+  trap - INT TERM
+  echo
+  umask 077
+  printf '%s\n' "$pw" > /run/nsbldr/vault-password
+  unset pw
+  export ANSIBLE_VAULT_PASSWORD_FILE=/run/nsbldr/vault-password
+  for f in /srv/ansible/access/*; do
+    out=$(ansible-vault decrypt --output "/run/nsbldr/${f##*/}" "$f" 2>&1) || { echo "nsbldr-init: $out" >&2; exit 1; }
+  done
+  if [ -e /run/nsbldr/platform.cfg ]; then
+    ln -sf /run/nsbldr/platform.cfg /root/.tower_cli.cfg
+    ln -sf /run/nsbldr/platform.cfg /root/.controller_cli.cfg
+  fi
+  if [ -e /run/nsbldr/kubeconfig ]; then
+    mkdir -p /root/.kube
+    ln -sf /run/nsbldr/kubeconfig /root/.kube/config
+  fi
+fi
+
+if [ -e /root/.tower_cli.cfg ]; then
+  exec ctlenv "$@"
 fi
 exec "$@"

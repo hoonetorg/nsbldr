@@ -128,9 +128,32 @@ class TestAdditions(unittest.TestCase):
         self.assertIn(f"-v {cfg}:/root/.tower_cli.cfg:ro,z ", cmd)
         self.assertIn(f"-v {cfg}:/root/.controller_cli.cfg:ro,z ", cmd)
         self.assertIn(f"-v {kube}:/root/.kube/config:ro,z ", cmd)
-        # no CA certificates -> no init wrapper, command as without mounts
-        self.assertIn("--rm --entrypoint ansible-playbook ", cmd)
-        self.assertNotIn("nsbldr-init", cmd)
+        # plain files: init wrapper (runs the command through ctlenv), no tmpfs, no tty
+        self.assertIn("--rm --entrypoint nsbldr-init ", cmd)
+        self.assertNotIn("--tmpfs", cmd)
+
+    def test_encrypted_access_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "platform.cfg"
+            kube = Path(d) / "kubeconfig"
+            cfg.write_text("$ANSIBLE_VAULT;1.1;AES256\n6162\n")
+            kube.write_text("apiVersion: v1\n")
+            mounts = CN.get_optional_mounts({"controllerconfigfile": str(cfg), "kubeconfigfile": str(kube)})
+            self.assertEqual(mounts, [(cfg, "/srv/ansible/access/platform.cfg"), (kube, "/root/.kube/config")])
+            with mock.patch.object(sys, "stdin", Tty()), mock.patch.object(sys, "stdout", NoTty()):
+                default = run_cmd(CN, optionalmounts=mounts)
+                piped = run_cmd(CN, optionalmounts=mounts, entrypoint="awx")
+            with mock.patch.object(sys, "stdin", NoTty()), mock.patch.object(sys, "stdout", NoTty()):
+                notty = run_cmd(CN, optionalmounts=mounts)
+            interactive = run_cmd(CN, interactive=True, optionalmounts=mounts)
+        tmpfs = "--tmpfs /run/nsbldr:rw,mode=0700,noexec,nosuid,nodev "
+        # a terminal for the password prompt whenever stdin is one
+        self.assertIn("--rm -it --entrypoint nsbldr-init " + tmpfs, default)
+        self.assertIn("--rm -it --entrypoint nsbldr-init " + tmpfs, piped)
+        self.assertIn("--rm --entrypoint nsbldr-init " + tmpfs, notty)
+        self.assertIn("--rm -it --entrypoint nsbldr-init " + tmpfs, interactive)
+        self.assertIn(f"-v {cfg}:/srv/ansible/access/platform.cfg:ro,z ", default)
+        self.assertNotIn("/root/.tower_cli.cfg", default)
 
     def test_cacerts_files_and_dirs(self):
         with tempfile.TemporaryDirectory() as d:

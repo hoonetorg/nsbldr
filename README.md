@@ -76,7 +76,7 @@ allocated when attached to a terminal, so output can be piped.
 ```
 ./cnsbldr --entrypoint ansible --version
 ./cnsbldr --entrypoint ansible-doc <collection>.<module>
-./cnsbldr --entrypoint ctlenv awx projects list -f human
+./cnsbldr --entrypoint awx projects list -f human
 ./cnsbldr --entrypoint kubectl get pods -n <namespace>
 ```
 
@@ -112,11 +112,13 @@ Which tool reads what:
 | tool | connection | CA |
 |---|---|---|
 | platform modules (playbooks) | `controllerconfigfile` or `CONTROLLER_*` env | system trust store (+ `cacerts`), `verify_ssl` |
-| platform CLIs (`awx`, ...) | `CONTROLLER_*` env only: run them through `ctlenv` | system trust store (+ `cacerts`), `verify_ssl` |
+| platform CLIs (`awx`, ...) | `CONTROLLER_*` env only, set from `controllerconfigfile` at start | system trust store (+ `cacerts`), `verify_ssl` |
 | `kubectl`, `oc` | `kubeconfigfile` | kubeconfig, else system trust store (+ `cacerts`) |
 
-`ctlenv <command>` sets the `CONTROLLER_*` variables from the mounted config file for that command
-only and prints nothing. The `awx` CLI uses username / password (no token), other platform CLIs also
+With `controllerconfigfile`, the container runs the command (or the `--interactive` shell) through
+`ctlenv`: it sets the `CONTROLLER_*` variables from the config file once at start, for everything started
+there, and prints nothing. After changing the file, start the container again. The old form
+`--entrypoint ctlenv <command>` still works. The `awx` CLI uses username / password (no token), other platform CLIs also
 the token.
 
 `CONTROLLER_HOST`, `CONTROLLER_USERNAME`, `CONTROLLER_PASSWORD`, `CONTROLLER_OAUTH_TOKEN`,
@@ -125,6 +127,21 @@ so the values are not in the logged podman command - but visible in `podman insp
 container runs. The config file is the better way.
 
 Read-only smoke test: `examples/controller/ping.yml` (copy it into the playbooks dir).
+
+### Encrypted access files
+
+`controllerconfigfile` and `kubeconfigfile` may be encrypted with `ansible-vault encrypt`, e.g. to keep them
+in git. Then the container asks once at start for the vault password:
+
+- the password and the decrypted files stay in a tmpfs in the container (RAM only, gone when it stops);
+  the files are linked where the tools look for them
+- `ansible-playbook` and `ansible-vault` use the same password (`ANSIBLE_VAULT_PASSWORD_FILE`): encrypt
+  the inventory vault files with it too and drop `--ask-vault-password` from `ansiblecommand`
+- `--interactive`: one prompt, then all commands in the shell run without further prompts
+- needs a terminal; without one (cron, `< /dev/null`) the container stops with an error. With a
+  terminal, output piped to another command has `\r\n` line endings
+- a vault password stored on the platform as a Vault credential should not be this password: whoever can
+  use that credential could decrypt the access files
 
 ## Secrets
 

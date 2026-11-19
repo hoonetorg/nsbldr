@@ -20,8 +20,8 @@ DEFAULT_ENTRYPOINT = "ansible-playbook"
 # optional host.json keys: host files mounted read-only into the container (never packed by --encrypt-content)
 OPTIONAL_HOSTCONF_FILES = {
     # [general] host/username/password/oauth_token/verify_ssl for AWX / AAP / clones: read by the platform
-    # modules (one collection reads ~/.tower_cli.cfg, another ~/.controller_cli.cfg); for the platform CLIs
-    # (env only) run them through `ctlenv`
+    # modules (one collection reads ~/.tower_cli.cfg, another ~/.controller_cli.cfg); nsbldr-init runs the
+    # command through `ctlenv`, which sets CONTROLLER_* for the platform CLIs (env only)
     "controllerconfigfile": ["/root/.tower_cli.cfg", "/root/.controller_cli.cfg"],
     # kubeconfig for kubectl / oc
     "kubeconfigfile": ["/root/.kube/config"],
@@ -31,6 +31,11 @@ OPTIONAL_HOSTCONF_FILES = {
 CACERTS_KEY = "cacerts"
 CA_ANCHORS_DIR = "/etc/pki/ca-trust/source/anchors"
 INIT_ENTRYPOINT = "nsbldr-init"
+# ansible-vault encrypted access files are mounted here instead; nsbldr-init asks once for the vault password
+# and decrypts them into a tmpfs (RAM only)
+ACCESS_DIR = "/srv/ansible/access"
+ACCESS_NAMES = {"controllerconfigfile": "platform.cfg", "kubeconfigfile": "kubeconfig"}
+VAULT_TMPFS = "/run/nsbldr"
 LOCAL_ONLY_HOSTCONF_KEYS = [*OPTIONAL_HOSTCONF_FILES, CACERTS_KEY]
 # passed into the container only if set on the host
 PASSTHROUGH_ENV = [
@@ -74,6 +79,11 @@ def get_path(path: str) -> Path:
 
 def is_readable_file(file: Path) -> bool:
     return file.exists() and file.is_file() and os.access(file, os.R_OK)
+
+
+def is_vault_encrypted(file: Path) -> bool:
+    with open(file, "rb") as f:
+        return f.read(15) == b"$ANSIBLE_VAULT;"
 
 
 def is_readable_dir(path: Path) -> bool:
@@ -322,8 +332,9 @@ def playbook(
     dryrun: bool = False,
 ):
     optionalmounts = optionalmounts or []
-    # CA certificates need the trust store updated at start: nsbldr-init runs first, then the command
-    use_init = any(dst.startswith(f"{CA_ANCHORS_DIR}/") for _, dst in optionalmounts)
+    # platform access (CA certificates, config files, encrypted files): nsbldr-init runs first, then the command
+    use_init = bool(optionalmounts)
+    encrypted = any(dst.startswith(f"{ACCESS_DIR}/") for _, dst in optionalmounts)
 
     ctrargs = "--rm "
     if interactive:
@@ -338,11 +349,15 @@ def playbook(
         # always explicit: images built on an execution environment keep the EE's entrypoint
         command = entrypoint
         tty = ""
+    if encrypted and not interactive and sys.stdin.isatty():
+        tty = "-it "  # nsbldr-init asks for the vault password on the terminal
     if use_init:
         ctrargs += f"{tty}--entrypoint {INIT_ENTRYPOINT} "
         args = [command, *args]
     else:
         ctrargs += f"{tty}--entrypoint {shlex.quote(command)} "
+    if encrypted:
+        ctrargs += f"--tmpfs {VAULT_TMPFS}:rw,mode=0700,noexec,nosuid,nodev "
 
     for src, dst in optionalmounts:
         ctrargs += f"-v {shlex.quote(str(src))}:{shlex.quote(dst)}:ro,z "
@@ -413,7 +428,10 @@ def get_optional_mounts(hostconf: dict) -> list[tuple[Path, str]]:
             src = get_path(hostconf[key])
             if not is_readable_file(src):
                 raise FileNotFoundError(f"host.json {key}: file not found or not readable: {src}")
-            mounts.extend((src, dst) for dst in dsts)
+            if is_vault_encrypted(src):
+                mounts.append((src, f"{ACCESS_DIR}/{ACCESS_NAMES[key]}"))
+            else:
+                mounts.extend((src, dst) for dst in dsts)
     if hostconf.get(CACERTS_KEY):
         for n, src in enumerate(get_ca_files(hostconf[CACERTS_KEY]), start=1):
             mounts.append((src, f"{CA_ANCHORS_DIR}/nsbldr-{n}-{src.name}"))
