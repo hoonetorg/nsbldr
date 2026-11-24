@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Vault passwords in RAM ($XDG_RUNTIME_DIR, tmpfs), one file per label, asked once per label.
+
+  eval "$(vaultpw platform appservers)"   # sets ANSIBLE_VAULT_IDENTITY_LIST in this shell
+  eval "$(vaultpw --clear)"               # deletes all, unsets it
+
+In ~/.bashrc: vp() { eval "$(/path/to/vaultpw "$@")"; }
+Prompts go to the terminal; stdout carries only the export/unset line (paths, no passwords).
+"""
+import getpass
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def runtime_dir() -> Path:
+    d = os.environ.get("XDG_RUNTIME_DIR", "")
+    fs = subprocess.run(["stat", "-f", "-c", "%T", d], capture_output=True, text=True).stdout.strip() if d else ""
+    if fs not in ("tmpfs", "ramfs"):
+        sys.exit("vaultpw: XDG_RUNTIME_DIR unset or not tmpfs - passwords are never written to disk")
+    return Path(d)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        sys.exit(__doc__)
+    store = runtime_dir() / "nsbldr-vault"
+    if args == ["--clear"]:
+        shutil.rmtree(store, ignore_errors=True)
+        print("unset ANSIBLE_VAULT_IDENTITY_LIST")
+        return
+    for label in args:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
+            sys.exit(f"vaultpw: invalid label: {label}")
+    if not sys.stdin.isatty():
+        sys.exit("vaultpw: needs a terminal for the password prompt")
+    store.mkdir(mode=0o700, exist_ok=True)
+    store.chmod(0o700)
+    ids = []
+    for label in args:
+        f = store / label
+        if not f.exists():
+            pw = getpass.getpass(f"Vault password {label}: ")
+            if not pw:
+                sys.exit("vaultpw: empty password")
+            with os.fdopen(os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+                fh.write(pw + "\n")
+        ids.append(f"{label}@{f}")
+    print(f"unset ANSIBLE_VAULT_PASSWORD_FILE; export ANSIBLE_VAULT_IDENTITY_LIST={shlex.quote(','.join(ids))}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

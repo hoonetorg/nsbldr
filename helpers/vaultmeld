@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""vaultmeld A B: compare two files or folders with fully vault-encrypted files decrypted.
+
+Copies both into RAM ($XDG_RUNTIME_DIR, tmpfs), decrypts with the passwords loaded by vaultpw
+(ANSIBLE_VAULT_IDENTITY_LIST), opens meld (diff -ru without a display) and deletes the copies at the end.
+View only: changes in the copies are lost. Inline !vault values stay encrypted.
+"""
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    if not os.environ.get("ANSIBLE_VAULT_IDENTITY_LIST"):
+        sys.exit('vaultmeld: no vault passwords loaded, first: eval "$(vaultpw <label> ...)"')
+    rt = os.environ.get("XDG_RUNTIME_DIR", "")
+    fs = subprocess.run(["stat", "-f", "-c", "%T", rt], capture_output=True, text=True).stdout.strip() if rt else ""
+    if fs not in ("tmpfs", "ramfs"):
+        sys.exit("vaultmeld: XDG_RUNTIME_DIR unset or not tmpfs - decrypted copies are never written to disk")
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: sys.exit(1))
+    d = Path(tempfile.mkdtemp(dir=rt, prefix="vaultmeld-"))
+    try:
+        print(f"decrypted copies: {d}", flush=True)
+        sides = []
+        for side, arg in (("a", sys.argv[1]), ("b", sys.argv[2])):
+            src = Path(arg).resolve()
+            dst = d / side / src.name
+            dst.parent.mkdir()
+            if src.is_dir():
+                shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+            else:
+                shutil.copy2(src, dst)
+            sides.append(str(dst))
+        # symlinks skipped: decrypting one would write through to its target outside the copy
+        for f in sorted(p for p in d.rglob("*") if p.is_file() and not p.is_symlink()):
+            with open(f, "rb") as fh:
+                if fh.read(15) != b"$ANSIBLE_VAULT;":
+                    continue
+            if subprocess.run(["ansible-vault", "decrypt", str(f)], capture_output=True).returncode:
+                print(f"not decrypted: {f.relative_to(d)}", flush=True)
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            subprocess.Popen(["meld", *sides], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            input("Enter deletes the decrypted copies (close meld first) ")
+        else:
+            subprocess.run(["diff", "-ru", *sides])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
